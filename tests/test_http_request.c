@@ -82,6 +82,17 @@ static void test_headers_and_connection(void) {
     CHECK(parse_header_line("Content-Length: abc\r\n", &req) == 400);
     CHECK(parse_header_line("Content-Length: -5\r\n", &req) == 400);
 
+    // close와 keep-alive가 함께 오면 close가 이긴다 (순서·대소문자·여러 헤더 줄과 무관)
+    http_request both = { 0 };
+    both.keep_alive = 1;
+    CHECK(parse_header_line("Connection: close, keep-alive\r\n", &both) == 0);
+    CHECK(both.keep_alive == 0);
+    http_request both2 = { 0 };
+    both2.keep_alive = 1;
+    CHECK(parse_header_line("Connection: CLOSE\r\n", &both2) == 0);
+    CHECK(parse_header_line("Connection: keep-alive\r\n", &both2) == 0);   // 두 번째 줄이 close를 덮으면 안 됨
+    CHECK(both2.keep_alive == 0);
+
     // HTTP/1.0에서 Connection: keep-alive 명시 시 활성화
     http_request h10_req = { 0 };
     CHECK(parse_request_line("GET / HTTP/1.0\r\n", &h10_req) == 0);

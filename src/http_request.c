@@ -180,8 +180,8 @@ static int parse_content_length_val(const char *val, size_t *out_len) {
     return 0;
 }
 
-static void apply_connection_header(http_request *req, const char *val) {
-    // 콤마로 구분된 토큰 중 close / keep-alive 확인
+// 콤마로 구분된 값 목록(val)에 token이 있는지 (앞뒤 공백 무시, 대소문자 무시)
+static int has_token(const char *val, const char *token) {
     char tmp[MAX_HEADER_VALUE];
     snprintf(tmp, sizeof(tmp), "%s", val);
 
@@ -195,14 +195,25 @@ static void apply_connection_header(http_request *req, const char *val) {
         while (end > tok && (end[-1] == ' ' || end[-1] == '\t')) end--;
         *end = '\0';
 
-        if (strcasecmp(tok, "close") == 0) {
-            req->keep_alive = 0;
-        } else if (strcasecmp(tok, "keep-alive") == 0) {
-            req->keep_alive = 1;
-        }
-
+        if (strcasecmp(tok, token) == 0) return 1;
         tok = (comma != NULL) ? (comma + 1) : NULL;
     }
+    return 0;
+}
+
+// Connection 헤더 반영. close가 어디서든(같은 줄·앞선 줄) 한 번이라도 나오면 닫는다 —
+// 뒤에 온 keep-alive가 close를 덮어쓰면 클라이언트는 닫으려는데 서버는 기다리는 상태가 된다
+static void apply_connection_header(http_request *req, const char *val) {
+    if (has_token(val, "close")) {
+        req->keep_alive = 0;
+        return;
+    }
+    if (!has_token(val, "keep-alive")) return;
+    for (int i = 0; i < req->header_count; i++) {          // 이미 저장된 Connection 헤더에 close가 있었는지
+        if (strcasecmp(req->headers[i].name, "Connection") == 0 && has_token(req->headers[i].value, "close"))
+            return;
+    }
+    req->keep_alive = 1;
 }
 
 int parse_header_line(const char *line, http_request *req) {
@@ -384,7 +395,11 @@ const char *get_header(const http_request *req, const char *name) {
 
 void free_request(http_request *req) {
     if (req == NULL) return;
+    // read_request는 읽기 실패(-1) 뒤 이 함수를 부르고, 바깥에서 errno(ETIMEDOUT/EAGAIN)를 보고 408을 정한다.
+    // free()가 errno를 보존한다는 보장은 최신 POSIX·glibc에만 있으므로 직접 보존한다
+    int saved_errno = errno;
     free(req->body);
+    errno = saved_errno;
     req->body = NULL;
     req->content_length = 0;
     req->header_count = 0;

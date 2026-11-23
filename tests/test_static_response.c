@@ -9,8 +9,10 @@
 #include "static_file.h"
 #include "test.h"
 
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <sys/resource.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -268,8 +270,82 @@ static void test_serve_static_cases(void) {
     cleanup_fixture(base);
 }
 
+// fd 한도(EMFILE)에서 파일을 못 열면 → 200 헤더를 보내기 전에 알아야 한다
+// (헤더를 먼저 보내고 open이 실패하면 응답이 반쯤 깨진 채 끊긴다) → 아무것도 안 보내고 503
+static void test_emfile_before_headers(void) {
+    char base[256], root[300];
+    setup_fixture(base, sizeof(base), root, sizeof(root));
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+    struct rlimit old;
+    getrlimit(RLIMIT_NOFILE, &old);
+    int dups[256], nd = 0;
+    // 현재 열린 fd를 다 채워 한도에 도달시킨다 (한도를 지금 개수 + 여유 몇 개로 낮춘 뒤 채움)
+    struct rlimit low = old;
+    low.rlim_cur = (rlim_t)(sv[1] + 8);
+    setrlimit(RLIMIT_NOFILE, &low);
+    for (;;) {
+        int d = dup(0);
+        if (d < 0) break;
+        if (nd < 256) dups[nd++] = d;
+        else { close(d); break; }
+    }
+
+    http_request req = { 0 };
+    snprintf(req.method, sizeof(req.method), "GET");
+    snprintf(req.path, sizeof(req.path), "/index.html");
+    int rc = serve_static(sv[0], root, &req);
+
+    for (int i = 0; i < nd; i++) close(dups[i]);
+    setrlimit(RLIMIT_NOFILE, &old);
+
+    CHECK(rc == 503);
+    close(sv[0]);
+    char buf[64];
+    CHECK(read(sv[1], buf, sizeof(buf)) == 0);              // 200 헤더가 먼저 나가면 안 됨
+    close(sv[1]);
+    cleanup_fixture(base);
+}
+
+// FIFO(이름 있는 파이프)는 일반 파일이 아님 → 403. open 순서를 바꾼 뒤에도 쓰는 쪽을 기다리며 멈추면 안 됨
+struct fifo_arg { const char *root; int rc; volatile int done; };
+static void *serve_fifo(void *p) {
+    struct fifo_arg *a = p;
+    a->rc = serve_expect_error(a->root, "GET", "/pipe");
+    a->done = 1;
+    return NULL;
+}
+
+static void test_fifo_not_served(void) {
+    char base[256], root[300], path[512];
+    setup_fixture(base, sizeof(base), root, sizeof(root));
+    snprintf(path, sizeof(path), "%s/pipe", root);
+    CHECK(mkfifo(path, 0644) == 0);
+    struct fifo_arg a = { .root = root, .rc = 0, .done = 0 };
+    pthread_t t;
+    if (pthread_create(&t, NULL, serve_fifo, &a) != 0) {
+        CHECK(!"pthread_create failed");
+        cleanup_fixture(base);
+        return;
+    }
+    for (int i = 0; i < 2000 && !a.done; i++) usleep(1000);
+    if (!a.done) {                                          // 멈춤 → 쓰는 쪽을 열어 풀어 주고 실패 기록
+        int w = open(path, O_WRONLY | O_NONBLOCK);
+        CHECK(!"serve_static blocked on FIFO");
+        pthread_join(t, NULL);
+        if (w >= 0) close(w);
+    } else {
+        pthread_join(t, NULL);
+        CHECK(a.rc == 403);
+    }
+    cleanup_fixture(base);
+}
+
 int main(void) {
     test_response_helpers();
+    test_emfile_before_headers();
+    test_fifo_not_served();
     test_header_injection_rejected();
     test_file_sizes();
     test_serve_static_cases();
