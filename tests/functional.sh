@@ -172,7 +172,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:$P
 elapsed=$(( $(now_ms) - t0 ))
 expect_eq "유휴 연결 3개가 있어도 다른 요청 처리됨" "$code" "200"
 [ "$elapsed" -le 1000 ] && ok "기다리지 않고 바로 응답 (${elapsed}ms, 다른 워커가 처리)" || bad "응답 지연" "${elapsed}ms"
-kill "${NCPIDS[@]}" 2>/dev/null
+kill "${NCPIDS[@]}" 2>/dev/null; wait "${NCPIDS[@]}" 2>/dev/null
 
 # 요청 라인만 보내고 멈춤 → 요청 도중의 타임아웃이므로 조용히 끊지 않고 408
 got=$({ printf 'GET / HTTP/1.1\r\n'; sleep 8; } | nc -q 1 127.0.0.1 "$PORT" | head -1 | tr -d '\r')
@@ -209,7 +209,7 @@ sleep 0.3
 t0=$(now_ms)
 kill -INT "$PID"; wait_exit 10; rc=$?
 elapsed=$(( $(now_ms) - t0 ))
-kill "$NCPID" 2>/dev/null
+kill "$NCPID" 2>/dev/null; wait "$NCPID" 2>/dev/null
 expect_eq "유휴 클라이언트가 붙어 있어도 SIGINT → exit 0" "$rc" "0"
 [ "$elapsed" -le 7000 ] && ok "타임아웃 안에 종료 (${elapsed}ms)" || bad "종료 지연" "${elapsed}ms"
 
@@ -255,7 +255,7 @@ expect_eq "(c) SIGINT 직후 새 연결은 받지 않음 (듣기 소켓 닫음)"
 kill -0 "$PID" 2>/dev/null && ok "(c) 처리 중인 연결이 끝날 때까지는 살아 있음" || bad "(c) 처리 중 생존" "이미 종료"
 wait_exit 10; rc=$?
 elapsed=$(( $(now_ms) - t0 ))
-kill "$NCPID" 2>/dev/null
+kill "$NCPID" 2>/dev/null; wait "$NCPID" 2>/dev/null
 expect_eq "(c) 처리 중인 연결을 마치고 정상 종료" "$rc" "0"
 [ "$elapsed" -le 7000 ] && ok "(c) 유휴 타임아웃 안에 종료 (${elapsed}ms)" || bad "(c) 종료 지연" "${elapsed}ms"
 
@@ -271,7 +271,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PO
 elapsed=$(( $(now_ms) - t0 ))
 expect_eq "워커·큐 모두 차면 503" "$code" "503"
 [ "$elapsed" -le 1000 ] && ok "기다리지 않고 바로 거절 (${elapsed}ms)" || bad "503 지연" "${elapsed}ms"
-kill "$B1" "$B2" 2>/dev/null
+kill "$B1" "$B2" 2>/dev/null; wait "$B1" "$B2" 2>/dev/null   # 클라이언트 종료를 확실히 기다린 뒤 복구 확인
 expect_eq "포화가 풀리면 다시 200" "$(until_200 "http://127.0.0.1:$PORT/" 15)" "200"
 stop_server
 
@@ -286,7 +286,7 @@ elapsed=$(( $(now_ms) - t0 ))
 expect_eq "큐에서 기다린 요청도 처리됨" "$code" "200"
 [ "$elapsed" -le 2000 ] && ok "keep-alive 연결이 응답 후 워커를 양보 (${elapsed}ms)" || bad "워커 양보 안 함" "${elapsed}ms (A의 유휴 타임아웃까지 대기)"
 grep -q '^Connection: close' /tmp/w13_conn_a && ok "양보한 연결 A의 응답은 Connection: close" || bad "A 응답 헤더" "$(head -5 /tmp/w13_conn_a)"
-kill "$A" 2>/dev/null
+kill "$A" 2>/dev/null; wait "$A" 2>/dev/null
 rm -f /tmp/w13_conn_a
 stop_server
 
@@ -302,7 +302,7 @@ ticks() { awk '{ print $14 + $15 }' /proc/"$PID"/stat; }   # 사용자+커널 CP
 c0=$(ticks); sleep 1; c1=$(ticks)
 kill -0 "$PID" 2>/dev/null && ok "fd 한도에 걸려도 서버 생존" || bad "EMFILE 생존" "종료됨"
 [ $((c1 - c0)) -le 30 ] && ok "헛돌지 않음 (1초 동안 CPU $((c1 - c0))/100초)" || bad "EMFILE 바쁜 대기" "CPU $((c1 - c0))/100초"
-kill "${HOLD[@]}" 2>/dev/null
+kill "${HOLD[@]}" 2>/dev/null; wait "${HOLD[@]}" 2>/dev/null
 expect_eq "fd가 돌아오면 다시 200" "$(until_200 "http://127.0.0.1:$PORT/" 20)" "200"
 left=$(for p in "${HOLD[@]}"; do kill -0 "$p" 2>/dev/null && echo "$p"; done | wc -l)
 expect_eq "연결을 붙잡던 클라이언트 프로세스가 모두 정리됨" "$left" "0"
