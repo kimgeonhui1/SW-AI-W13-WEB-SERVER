@@ -347,6 +347,41 @@ expect_eq "시간 초과 CGI가 띄운 자식(sleep)까지 종료" "$(pgrep -fc 
 stop_server
 rm -rf "$CGID"
 
+# ───────────── 13. Reverse Proxy ─────────────
+echo "== 13. Reverse Proxy"
+RP=$(mktemp -d)
+B1=$((PORT + 11)); B2=$((PORT + 12))
+for i in 1 2; do mkdir -p "$RP/b$i/api"; printf "b$i" > "$RP/b$i/api/who.txt"; done
+"$SERVER" -p $B1 -r "$RP/b1" >/dev/null 2>&1 & BP1=$!
+"$SERVER" -p $B2 -r "$RP/b2" >/dev/null 2>&1 & BP2=$!
+printf '# test\n/api/ 127.0.0.1:%s 127.0.0.1:%s\n' $B1 $B2 > "$RP/routes.conf"
+until_200 "http://127.0.0.1:$B1/api/who.txt" 5 >/dev/null; until_200 "http://127.0.0.1:$B2/api/who.txt" 5 >/dev/null
+start_server -c "$RP/routes.conf" && ok "routes.conf로 시작" || bad "Reverse Proxy 시작" "$(cat "$LOG")"
+grep -q "1 route(s)" "$LOG" && ok "규칙 1개 로드 메시지" || bad "로드 메시지" "$(cat "$LOG")"
+RU="http://127.0.0.1:$PORT"
+two="$(curl -s "$RU/api/who.txt") $(curl -s "$RU/api/who.txt")"
+[ "$two" = "b1 b2" ] || [ "$two" = "b2 b1" ] && ok "Round-Robin: 두 백엔드가 번갈아 응답 ($two)" || bad "Round-Robin" "$two"
+curl -s "$RU/" | cmp -s - www/index.html && ok "규칙에 없는 경로는 프록시가 직접 정적 파일" || bad "직접 처리" "다름"
+expect_eq "백엔드의 404를 그대로 전달" "$(curl -s -o /dev/null -w '%{http_code}' "$RU/api/nope")" "404"
+expect_eq "백엔드의 405(POST)를 그대로 전달" "$(curl -s -o /dev/null -w '%{http_code}' -d x=1 "$RU/api/who.txt")" "405"
+expect_eq "HEAD 전달 (본문 없이 바로 끝남)" "$(curl -s -I --max-time 2 -o /dev/null -w '%{http_code}' "$RU/api/who.txt")" "200"
+conns=$(curl -s -o /dev/null -o /dev/null -w '%{num_connects} ' "$RU/api/who.txt" "$RU/api/who.txt")
+expect_eq "프록시를 거쳐도 클라이언트 keep-alive 유지 (새 연결 수)" "$conns" "1 0 "
+kill -INT $BP1; wait $BP1
+got=$(for _ in 1 2 3 4; do curl -s "$RU/api/who.txt"; done)
+expect_eq "백엔드 1 종료 → 모든 요청이 백엔드 2로" "$got" "b2b2b2b2"
+kill -INT $BP2; wait $BP2
+expect_eq "백엔드 모두 종료 → 502" "$(curl -s -o /dev/null -w '%{http_code}' "$RU/api/who.txt")" "502"
+expect_eq "백엔드가 없어도 직접 처리 경로는 정상" "$(curl -s -o /dev/null -w '%{http_code}' "$RU/")" "200"
+stop_server
+printf '/api/ 127.0.0.1:8001\n/bad/ nocolon\n' > "$RP/bad.conf"
+out=$(timeout 3 "$SERVER" -p "$PORT" -c "$RP/bad.conf" 2>&1); rc=$?
+expect_eq "형식이 틀린 routes.conf → exit 1" "$rc" "1"
+echo "$out" | grep -q "bad.conf:2:" && ok "오류 줄 번호 출력 (bad.conf:2)" || bad "오류 줄 번호" "$out"
+timeout 3 "$SERVER" -p "$PORT" -c "$RP/none.conf" >/dev/null 2>&1
+expect_eq "없는 routes.conf → exit 1" "$?" "1"
+rm -rf "$RP"
+
 echo
 echo "결과: 통과 $PASS, 실패 $FAIL"
 [ "$FAIL" -eq 0 ]

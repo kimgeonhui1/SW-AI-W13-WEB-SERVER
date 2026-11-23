@@ -22,6 +22,7 @@
 #include "http_response.h"
 #include "net.h"
 #include "rio.h"
+#include "proxy.h"
 #include "router.h"
 #include "static_file.h"
 #include "threadpool.h"
@@ -56,8 +57,11 @@ static void set_nonblocking(int fd, int on) {
 
 int run_server(const server_config *cfg) {
     server_configure(cfg);
-    (void)g_routes;
-    // TODO(6단계): routes_path가 있으면 load_routes
+    // 설정 파일이 있으면 시작할 때 한 번 읽는다. 형식이 틀리면 잘못된 라우팅으로 도는 대신 시작하지 않는다
+    if (cfg->routes_path != NULL) {
+        if (load_routes(cfg->routes_path, &g_routes) != 0) return -1;
+        printf("reverse proxy: %d route(s) from %s\n", g_routes.count, cfg->routes_path);
+    }
 
     int listenfd = open_listenfd(cfg->port);
     if (listenfd < 0) return -1;
@@ -141,7 +145,9 @@ static int dispatch(int connfd, const http_request *req) {
         if (!g_cfg->forward_enabled) return 403;    // -f 없이 열린 프록시가 되지 않도록
         return 501;                             // TODO(7단계): forward_proxy_request
     }
-    // TODO(6단계): match_route(&g_routes, req->path) → reverse_proxy_request
+    // 라우팅 규칙에 맞으면 백엔드로 (CGI·정적 파일보다 먼저: 설정한 경로는 이 서버가 직접 처리하지 않는다)
+    route *r = match_route(&g_routes, req->path);
+    if (r != NULL) return reverse_proxy_request(connfd, req, r);
     if (strncmp(req->path, CGI_PREFIX, strlen(CGI_PREFIX)) == 0) {
         return serve_cgi(connfd, g_cfg->cgi_dir, req);
     }
