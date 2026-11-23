@@ -293,6 +293,38 @@ static void test_idle_client_times_out(void) {
     close(sv[0]);
 }
 
+// keep-alive: 첫 응답 뒤 다음 요청 없이 연결만 유지 → 약 KEEPALIVE_TIMEOUT_SEC 뒤 조용히 종료
+// (응답은 1개, 408 같은 추가 응답 없음 — 요청 시작 전 대기는 정상적인 유휴이므로)
+static void test_keepalive_idle_after_response(void) {
+    int sv[2];
+    make_pair(sv);
+    rio_writen(sv[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n", 27);   // shutdown 안 함 → 연결 유지
+    time_t start = time(NULL);
+    handle_connection(sv[1]);
+    time_t elapsed = time(NULL) - start;
+    CHECK(elapsed >= KEEPALIVE_TIMEOUT_SEC - 1 && elapsed <= KEEPALIVE_TIMEOUT_SEC + 3);
+    char resp[2048];
+    read_all(sv[0], resp, sizeof(resp));
+    close(sv[0]);
+    CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0);
+    CHECK(count_responses(resp) == 1);
+}
+
+// 요청 도중(요청 라인만 받고) 멈춤 → 수신 타임아웃(5초)에 걸려도 응답 없이 끊지 말고 408을 알려 줌
+static void test_stalled_mid_request_gets_408(void) {
+    int sv[2];
+    make_pair(sv);
+    rio_writen(sv[0], "GET / HTTP/1.1\r\n", 16);
+    time_t start = time(NULL);
+    handle_connection(sv[1]);
+    time_t elapsed = time(NULL) - start;
+    CHECK(elapsed >= KEEPALIVE_TIMEOUT_SEC - 1 && elapsed <= KEEPALIVE_TIMEOUT_SEC + 3);
+    char resp[2048];
+    read_all(sv[0], resp, sizeof(resp));
+    close(sv[0]);
+    CHECK(strncmp(resp, "HTTP/1.1 408 Request Timeout\r\n", 30) == 0);
+}
+
 // 한 줄 안에서 1바이트씩 천천히 보내는 slowloris → read 하나하나는 수신 타임아웃에 안 걸려도
 // 요청 전체 시간 제한(REQUEST_TIMEOUT_SEC)에 걸려 408 후 종료
 struct drip_arg { int fd; volatile int stop; };
@@ -345,8 +377,10 @@ int main(void) {
     test_closes_connfd();
     test_client_gone_before_response();
     test_fragmented_request();
-    fprintf(stderr, "  (시간 제한 테스트: 약 %d초 걸림)\n", KEEPALIVE_TIMEOUT_SEC + REQUEST_TIMEOUT_SEC);
+    fprintf(stderr, "  (시간 제한 테스트: 약 %d초 걸림)\n", 3 * KEEPALIVE_TIMEOUT_SEC + REQUEST_TIMEOUT_SEC);
     test_idle_client_times_out();
+    test_keepalive_idle_after_response();
+    test_stalled_mid_request_gets_408();
     test_slowloris_gets_408();
     teardown();
     return TEST_RESULT();

@@ -363,8 +363,11 @@ int read_request(rio_t *rp, http_request *req) {
     if (rp == NULL || req == NULL) return -1;
     rp->deadline = 0;
     int rc = read_request_inner(rp, req);
-    // 요청 도중 전체 시간 제한 초과 → 응답 없이 끊지 않고 408을 알려 준다
-    if (rc == -1 && rp->deadline > 0 && errno == ETIMEDOUT) rc = 408;
+    // 요청을 받는 도중(deadline이 설정된 뒤)의 시간 초과 → 응답 없이 끊지 않고 408을 알려 준다
+    //   ETIMEDOUT: 요청 전체 제한(10초) 초과 / EAGAIN: read 한 번이 수신 타임아웃(5초)에 걸림 (요청 라인만 보내고 멈춤)
+    // 요청 시작 전(deadline 0) keep-alive 대기의 시간 초과는 정상 유휴라 그대로 -1 → 조용히 닫는다
+    if (rc == -1 && rp->deadline > 0 &&
+        (errno == ETIMEDOUT || errno == EAGAIN || errno == EWOULDBLOCK)) rc = 408;
     rp->deadline = 0;                      // keep-alive 다음 요청을 기다리는 동안엔 제한 없음
     return rc;
 }

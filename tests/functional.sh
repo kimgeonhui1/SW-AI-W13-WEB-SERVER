@@ -162,6 +162,15 @@ expect_eq "유휴 클라이언트 뒤 요청도 처리됨" "$code" "200"
 [ "$elapsed" -ge 3500 ] && [ "$elapsed" -le 7000 ] && ok "대기 시간 약 5초 (${elapsed}ms)" || bad "대기 시간" "${elapsed}ms"
 kill "$NCPID" 2>/dev/null
 
+# 요청 라인만 보내고 멈춤 → 요청 도중의 타임아웃이므로 조용히 끊지 않고 408
+got=$({ printf 'GET / HTTP/1.1\r\n'; sleep 8; } | nc -q 1 127.0.0.1 "$PORT" | head -1 | tr -d '\r')
+expect_eq "요청 도중 멈춘 클라이언트 → 408" "$got" "HTTP/1.1 408 Request Timeout"
+
+# 1바이트씩 천천히 보내는 slowloris → 요청 전체 제한(10초)에 걸려 408
+got=$({ printf 'GET / HTTP/1.1\r\nX-Slow: '; for _ in $(seq 14); do printf 'a'; sleep 1; done; } \
+      | nc -q 1 127.0.0.1 "$PORT" | head -1 | tr -d '\r')
+expect_eq "slowloris(1초에 1바이트) → 408" "$got" "HTTP/1.1 408 Request Timeout"
+
 # ───────────── 7. 같은 포트 중복 실행 ─────────────
 echo "== 7. 포트 충돌"
 timeout 3 "$SERVER" -p "$PORT" >/dev/null 2>&1
