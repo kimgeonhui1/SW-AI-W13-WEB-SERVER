@@ -1,0 +1,21 @@
+# [ci.yml] PR·push마다 빌드(경고를 오류로) → 단위 테스트 → AddressSanitizer 빌드·테스트
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    env:
+      CFLAGS: -std=gnu11 -Wall -Wextra -Werror -g -O2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make
+      - name: Unit tests
+        run: make test
+      - name: AddressSanitizer
+        run: make asan

@@ -53,3 +53,8 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Build outputs (make)
+bin/
+build/
+cgi-bin/adder
