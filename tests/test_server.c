@@ -1,5 +1,5 @@
 // [test_server.c] handle_connection 단위 테스트 — socketpair 한쪽을 "클라이언트", 다른 쪽을 connfd로 넘겨 검증
-// 요청 읽기 → 분기(정적 파일 / CGI·Forward 미구현 501 / Forward 비활성 403) → 응답, keep-alive 반복, 시간 제한, 연결 정리
+// 요청 읽기 → 분기(정적 파일 / CGI / Forward 미구현 501 / Forward 비활성 403) → 응답, keep-alive 반복, 시간 제한, 연결 정리
 #include "test.h"
 #include "http_request.h"
 #include "server.h"
@@ -172,8 +172,10 @@ static void test_error_codes(void) {
     exchange("GET /../../../../../../../../etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n", resp, sizeof(resp));
     CHECK(strncmp(resp, "HTTP/1.1 403", 12) == 0);
     CHECK(strstr(resp, "root:") == NULL);
-    exchange("GET /cgi-bin/adder?a=1 HTTP/1.1\r\nHost: x\r\n\r\n", resp, sizeof(resp));
-    CHECK(strncmp(resp, "HTTP/1.1 501", 12) == 0);                                   // CGI는 5단계
+    exchange("GET /cgi-bin/adder?a=1&b=2 HTTP/1.1\r\nHost: x\r\n\r\n", resp, sizeof(resp));
+    CHECK(strncmp(resp, "HTTP/1.1 200", 12) == 0 && strstr(resp, "1 + 2 = 3") != NULL); // CGI (cgi-bin/adder)
+    exchange("GET /cgi-bin/nope HTTP/1.1\r\nHost: x\r\n\r\n", resp, sizeof(resp));
+    CHECK(strncmp(resp, "HTTP/1.1 404", 12) == 0);                                   // 없는 CGI
     exchange("GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n", resp, sizeof(resp));
     CHECK(strncmp(resp, "HTTP/1.1 403", 12) == 0);                                   // -f 없이 Forward 요청
 }

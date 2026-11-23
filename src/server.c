@@ -114,6 +114,8 @@ int run_server(const server_config *cfg) {
             perror("accept");               // 그 밖의 오류도 서버 전체를 죽이지 않고 다음 연결을 기다린다
             continue;
         }
+        // shortcut: accept와 set_cloexec 사이에 다른 워커가 CGI를 fork하면 이 fd가 그 CGI에 샐 수 있다(아주 짧은 틈).
+        //           Linux 전용으로 가도 되면 accept4(..., SOCK_CLOEXEC)로 바꿔 틈을 없앤다 (macOS에는 accept4 없음)
         set_cloexec(connfd);
         set_nonblocking(connfd, 0);         // macOS 등은 듣기 소켓의 O_NONBLOCK을 물려주므로 명시적으로 blocking
         if (threadpool_submit(pool, connfd) != 0) reject_busy(connfd);
@@ -141,7 +143,7 @@ static int dispatch(int connfd, const http_request *req) {
     }
     // TODO(6단계): match_route(&g_routes, req->path) → reverse_proxy_request
     if (strncmp(req->path, CGI_PREFIX, strlen(CGI_PREFIX)) == 0) {
-        return 501;                             // TODO(5단계): serve_cgi
+        return serve_cgi(connfd, g_cfg->cgi_dir, req);
     }
     return serve_static(connfd, g_cfg->root, req);
 }

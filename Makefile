@@ -30,7 +30,7 @@ $(BUILD)/test_%: tests/test_%.c $(OBJ)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-test: $(TESTS)
+test: $(TESTS) cgi-bin/adder
 	@for t in $(TESTS); do echo "== $$t"; ./$$t || exit 1; done
 
 # AddressSanitizer + UBSan: 메모리 누수·버퍼 오버플로우·정의되지 않은 동작 검사 → build/asan/server, build/asan/test_*

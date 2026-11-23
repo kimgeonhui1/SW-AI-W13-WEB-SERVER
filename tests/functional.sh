@@ -99,7 +99,14 @@ expect_eq "쿼리스트링 무시하고 파일 서빙" "$(curl -s -o /dev/null -
 expect_eq "없는 파일 → 404" "$(curl -s -o /dev/null -w '%{http_code}' "$U/nope.html")" "404"
 expect_eq "루트 탈출 ../ → 403" "$(curl -s --path-as-is -o /dev/null -w '%{http_code}' "$U/../Makefile")" "403"
 expect_eq "정적 파일에 POST → 405" "$(curl -s -o /dev/null -w '%{http_code}' -d 'a=1' "$U/")" "405"
-expect_eq "CGI 경로 (5단계 전) → 501" "$(curl -s -o /dev/null -w '%{http_code}' "$U/cgi-bin/adder?a=1&b=2")" "501"
+expect_eq "CGI GET adder" "$(curl -s "$U/cgi-bin/adder?a=1&b=2")" "1 + 2 = 3"
+expect_eq "CGI POST adder (본문 → 표준 입력)" "$(curl -s -d 'a=40&b=2' "$U/cgi-bin/adder")" "40 + 2 = 42"
+expect_eq "CGI Status 헤더 반영 (잘못된 입력 → 400)" "$(curl -s -o /dev/null -w '%{http_code}' "$U/cgi-bin/adder?a=x&b=2")" "400"
+expect_eq "없는 CGI → 404" "$(curl -s -o /dev/null -w '%{http_code}' "$U/cgi-bin/nope")" "404"
+expect_eq "CGI 하위 경로 탈출 → 404" "$(curl -s --path-as-is -o /dev/null -w '%{http_code}' "$U/cgi-bin/../Makefile")" "404"
+expect_eq "CGI Content-Length 있음" "$(curl -s -o /dev/null -w '%{size_download}' "$U/cgi-bin/adder?a=1&b=2")" "10"
+conns=$(curl -s -o /dev/null -o /dev/null -w '%{num_connects} ' "$U/cgi-bin/adder?a=1&b=2" "$U/cgi-bin/adder?a=3&b=4")
+expect_eq "CGI 응답 뒤 keep-alive 유지 (새 연결 수)" "$conns" "1 0 "
 expect_eq "Forward 요청, -f 없음 → 403" "$(curl -s -o /dev/null -w '%{http_code}' -x "127.0.0.1:$PORT" http://example.com/)" "403"
 head_out=$(curl -s -I "$U/" | tr -d '\r')
 echo "$head_out" | grep -q "^Content-Length: $(wc -c < www/index.html)$" && ok "HEAD: 헤더만, 길이는 GET과 같음" || bad "HEAD" "$head_out"
@@ -307,6 +314,29 @@ expect_eq "fd가 돌아오면 다시 200" "$(until_200 "http://127.0.0.1:$PORT/"
 left=$(for p in "${HOLD[@]}"; do kill -0 "$p" 2>/dev/null && echo "$p"; done | wc -l)
 expect_eq "연결을 붙잡던 클라이언트 프로세스가 모두 정리됨" "$left" "0"
 stop_server
+
+# ───────────── 12. CGI 격리 ─────────────
+echo "== 12. CGI 격리"
+CGID=$(mktemp -d)
+cat > "$CGID/fds" <<'SH'
+#!/bin/sh
+printf 'Content-Type: text/plain\n\n'
+n=0
+for f in /proc/$$/fd/*; do case "$(readlink "$f")" in socket:*) n=$((n + 1));; esac; done
+echo "$n"
+SH
+printf '#!/bin/sh\nprintf "Content-Type: a\\n\\n"\nsleep 31\n' > "$CGID/hang"
+chmod 755 "$CGID/fds" "$CGID/hang"
+start_server -g "$CGID"
+expect_eq "CGI가 서버의 소켓(듣기·클라이언트 연결)을 물려받지 않음" "$(curl -s "http://127.0.0.1:$PORT/cgi-bin/fds")" "0"
+t0=$(now_ms)
+expect_eq "멈춘 CGI → 504" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "http://127.0.0.1:$PORT/cgi-bin/hang")" "504"
+elapsed=$(( $(now_ms) - t0 ))
+[ "$elapsed" -le 7000 ] && ok "CGI 시간 제한 안에 응답 (${elapsed}ms)" || bad "CGI 시간 제한" "${elapsed}ms"
+sleep 0.2
+expect_eq "시간 초과 CGI가 띄운 자식(sleep)까지 종료" "$(pgrep -fc 'sleep 31$')" "0"
+stop_server
+rm -rf "$CGID"
 
 echo
 echo "결과: 통과 $PASS, 실패 $FAIL"

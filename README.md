@@ -69,6 +69,8 @@ make clean
 ./bin/server -p 8080 -r ./www -c conf/routes.conf      # Reverse Proxy
 ./bin/server -p 8080 -r ./www -f                       # Forward Proxy 허용
 
+curl "http://127.0.0.1:8080/cgi-bin/adder?a=1&b=2"               # CGI GET  → 1 + 2 = 3
+curl -d 'a=40&b=2' http://127.0.0.1:8080/cgi-bin/adder            # CGI POST → 40 + 2 = 42
 curl http://127.0.0.1:8080/api/                                   # Reverse
 curl -x 127.0.0.1:8080 http://127.0.0.1:8001/index.html           # Forward
 ```
@@ -82,6 +84,19 @@ curl -x 127.0.0.1:8080 http://127.0.0.1:8001/index.html           # Forward
 | `-f` | 꺼짐 | Forward Proxy 허용 |
 | `-t` | 8 | 워커 스레드 수 |
 | `-q` | 1024 | 연결 대기 큐 크기 (차면 503) |
+
+## CGI 동작
+
+`/cgi-bin/<이름>` → `cgi_dir/<이름>`을 `fork` + `execve`로 실행 (하위 폴더·`..` 불가)
+
+- 요청 정보는 환경변수(`REQUEST_METHOD`, `QUERY_STRING`, `CONTENT_LENGTH`, `CONTENT_TYPE`, `SCRIPT_NAME` …), POST 본문은 표준 입력으로 넘긴다
+- CGI의 표준 출력은 **소켓에 바로 연결하지 않고 파이프로 받는다** → 서버가 헤더(`Content-Type` 필수, `Status` 선택)를 검사하고 `Content-Length`를 붙여 보내므로 keep-alive가 유지되고, 잘못된 출력은 502로 막는다
+- 본문 쓰기와 출력 읽기는 `poll`로 동시에 (둘 다 파이프 버퍼 64KB보다 클 때 서로 기다리는 교착 방지)
+- 제한: 실행 5초(넘으면 프로세스 그룹째 SIGKILL, 504), 출력 1MB(넘으면 502). 항상 `waitpid`로 회수해 좀비 없음
+- 자식은 `execve` 전까지 async-signal-safe 함수만 사용(환경변수는 fork 전에 준비), 워커가 막아 둔 SIGINT/SIGTERM과 무시한 SIGPIPE는 기본값으로 되돌린다
+- 서버의 모든 fd(클라이언트 연결 포함)는 CLOEXEC → CGI에 새지 않는다
+- 오류: 없음 404 · 실행 권한 없음 403 · 실행 실패 500 · 형식 오류/비정상 종료/출력 과다 502 · 시간 초과 504
+- 성능: `adder` 동시 100연결 초당 약 1,300건 (요청마다 프로세스 생성, `/mnt/c`의 실행 파일)
 
 ## 성능 측정 (wrk, 10초, keep-alive, 워커 8개, `GET /` 306바이트)
 
