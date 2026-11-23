@@ -3,6 +3,7 @@
 #define SERVER_H
 
 #define KEEPALIVE_TIMEOUT_SEC 5   // keep-alive 연결이 이 시간 동안 다음 요청을 안 보내면 닫는다 (워커 점유 방지)
+#define SEND_TIMEOUT_SEC      10  // 응답을 읽지 않는 클라이언트에게 write가 이 시간 넘게 막히면 포기
 
 typedef struct {
     const char *port;          // -p  듣기 포트 (기본 "8080")
@@ -18,8 +19,11 @@ typedef struct {
 // 정상 종료 0, 시작 실패 -1
 int run_server(const server_config *cfg);
 
-// 연결 하나 처리 (워커 스레드에서 호출)
+// 연결 하나 처리 (워커 스레드에서 호출): keep-alive 동안 요청 읽기 → 분기 → 응답 반복, 끝나면 connfd를 닫는다
 void handle_connection(int connfd);
+
+// 설정만 등록 (run_server가 호출. 단위 테스트에서 run_server 없이 handle_connection을 쓸 때도 사용)
+void server_configure(const server_config *cfg);
 
 // 종료 요청 (SIGINT/SIGTERM 핸들러에서 호출 — 플래그만 세운다)
 void request_stop(void);

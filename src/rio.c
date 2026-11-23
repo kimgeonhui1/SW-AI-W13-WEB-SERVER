@@ -3,7 +3,14 @@
 
 #include <errno.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+
+double rio_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
 
 ssize_t rio_writen(int fd, const void *buf, size_t n) {
     const char *p = buf;
@@ -30,12 +37,19 @@ void rio_readinitb(rio_t *rp, int fd) {
     rp->fd = fd;
     rp->cnt = 0;
     rp->bufp = rp->buf;
+    rp->deadline = 0;
 }
 
 // 내부 버퍼에서 최대 n바이트를 꺼낸다. 버퍼가 비어 있을 때만 read를 한 번 호출해 크게 채운다.
 // 한 줄을 읽을 때 바이트마다 read(시스템 콜)를 부르지 않게 하는 것이 목적
 static ssize_t rio_read(rio_t *rp, char *usrbuf, size_t n) {
     while (rp->cnt <= 0) {
+        // 마감 시각 확인은 실제로 소켓에서 더 받아야 할 때만 — 버퍼에 남은 데이터는 시간과 상관없이 꺼내 준다.
+        // read마다 검사하므로 1바이트씩 천천히 보내는 클라이언트(slowloris)도 줄 중간에서 끊긴다
+        if (rp->deadline > 0 && rio_now() > rp->deadline) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
         rp->cnt = read(rp->fd, rp->buf, sizeof(rp->buf));
         if (rp->cnt < 0) {
             if (errno == EINTR) continue;   // 시그널로 끊김 → 다시 read

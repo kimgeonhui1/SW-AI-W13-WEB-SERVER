@@ -11,8 +11,12 @@ typedef struct {
     int fd;                  // 읽을 fd
     ssize_t cnt;             // 내부 버퍼에 아직 꺼내지 않은 바이트 수
     char *bufp;              // 내부 버퍼에서 다음에 꺼낼 위치
+    double deadline;         // 0이면 제한 없음. 아니면 rio_now() 기준 마감 시각 — 지나면 read 전에 -1(errno=ETIMEDOUT)
     char buf[RIO_BUFSIZE];   // 내부 버퍼 (read 한 번에 크게 받아 두고 조금씩 꺼낸다)
 } rio_t;
+
+// 단조 시계(초). 시스템 시계를 바꿔도 거꾸로 가지 않음 — deadline 계산용
+double rio_now(void);
 
 // n바이트를 다 쓸 때까지 write 반복. 성공 n, 실패 -1
 ssize_t rio_writen(int fd, const void *buf, size_t n);

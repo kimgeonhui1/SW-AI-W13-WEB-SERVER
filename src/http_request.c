@@ -270,15 +270,16 @@ int parse_header_line(const char *line, http_request *req) {
     return 0;
 }
 
-int read_request(rio_t *rp, http_request *req) {
-    if (rp == NULL || req == NULL) return -1;
-
+// 요청 하나 읽기 (실제 파싱). 시간 제한 설정·해제와 408 변환은 아래 read_request가 맡는다
+static int read_request_inner(rio_t *rp, http_request *req) {
     memset(req, 0, sizeof(*req));
 
     char line[MAX_LINE];
     ssize_t n = rio_readlineb(rp, line, sizeof(line));
     if (n < 0) return -1;
     if (n == 0) return -1; // 정상 EOF(요청 시작 전 연결 종료)
+    // 시간 제한은 요청 라인의 첫 줄을 받은 뒤부터 잰다 (그 전의 대기는 keep-alive 유휴 시간 → 수신 타임아웃이 담당)
+    rp->deadline = rio_now() + REQUEST_TIMEOUT_SEC;
     // 요청 라인이 버퍼보다 길어 잘림('\n' 없이 가득 참) → 잘린 줄은 버전이 빠져 400으로 오판되므로 414로 거부
     if (line[n - 1] != '\n' && (size_t)n == sizeof(line) - 1) return 414;
 
@@ -348,7 +349,7 @@ int read_request(rio_t *rp, http_request *req) {
             free_request(req);
             return -1;
         }
-        if ((size_t)got < req->content_length) {
+        if ((size_t)got < req->content_length) {   // 약속한 길이보다 일찍 EOF
             free_request(req);
             return 400;
         }
@@ -356,6 +357,16 @@ int read_request(rio_t *rp, http_request *req) {
     }
 
     return 0;
+}
+
+int read_request(rio_t *rp, http_request *req) {
+    if (rp == NULL || req == NULL) return -1;
+    rp->deadline = 0;
+    int rc = read_request_inner(rp, req);
+    // 요청 도중 전체 시간 제한 초과 → 응답 없이 끊지 않고 408을 알려 준다
+    if (rc == -1 && rp->deadline > 0 && errno == ETIMEDOUT) rc = 408;
+    rp->deadline = 0;                      // keep-alive 다음 요청을 기다리는 동안엔 제한 없음
+    return rc;
 }
 
 const char *get_header(const http_request *req, const char *name) {

@@ -18,6 +18,8 @@
 #define MAX_HEADER_NAME  64
 #define MAX_HEADER_VALUE 1024            // 넘으면 431
 #define MAX_BODY_LEN     (1024 * 1024)   // 넘으면 413
+#define REQUEST_TIMEOUT_SEC 10           // 요청 하나(라인+헤더+본문)를 다 받는 데 허용하는 전체 시간. 넘으면 408
+                                         // (read 한 번의 타임아웃만으론 1바이트씩 천천히 보내는 slowloris를 못 막음)
 
 typedef struct {
     char name[MAX_HEADER_NAME];

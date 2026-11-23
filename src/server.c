@@ -12,10 +12,14 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "cgi.h"
+#include "forward_proxy.h"
 #include "http_request.h"
+#include "http_response.h"
 #include "net.h"
 #include "rio.h"
 #include "router.h"
+#include "static_file.h"
 
 static const server_config *g_cfg;            // run_server가 설정, 워커들은 읽기만 함
 static route_table g_routes;                  // 시작 시 한 번 로드, 이후 읽기 + next 카운터(atomic)만 변경
@@ -28,8 +32,7 @@ static void set_nonblocking(int fd, int on) {
 }
 
 int run_server(const server_config *cfg) {
-    g_cfg = cfg;
-    (void)g_cfg;
+    server_configure(cfg);
     (void)g_routes;
     // TODO(6단계): routes_path가 있으면 load_routes
 
@@ -84,38 +87,83 @@ int run_server(const server_config *cfg) {
     return 0;
 }
 
-void handle_connection(int connfd) {
-    // TODO(3단계): 아래 임시 처리를 read_request + 분기(forward / reverse / cgi / static)로 교체
-    //              SO_RCVTIMEO(KEEPALIVE_TIMEOUT_SEC), keep-alive 반복, free_request
-    rio_t rio;
-    char line[MAX_LINE];
-    ssize_t n;
+void server_configure(const server_config *cfg) {
+    g_cfg = cfg;
+}
 
+// 요청 하나를 알맞은 핸들러로 보낸다. 반환 규약은 static_file.h와 같음 (0 / HTTP 오류 코드 / -1)
+static int dispatch(int connfd, const http_request *req) {
+    if (is_absolute_uri(req->uri)) {            // "GET http://host/..." = Forward Proxy 요청
+        if (!g_cfg->forward_enabled) return 403;    // -f 없이 열린 프록시가 되지 않도록
+        return 501;                             // TODO(7단계): forward_proxy_request
+    }
+    // TODO(6단계): match_route(&g_routes, req->path) → reverse_proxy_request
+    if (strncmp(req->path, CGI_PREFIX, strlen(CGI_PREFIX)) == 0) {
+        return 501;                             // TODO(5단계): serve_cgi
+    }
+    return serve_static(connfd, g_cfg->root, req);
+}
+
+// 오류 응답. HEAD 요청에는 본문을 붙이면 안 되므로(다음 응답과 섞임) 헤더만 보낸다
+static int reply_error(int connfd, int status, const http_request *req, int keep_alive) {
+    if (req != NULL && strcmp(req->method, "HEAD") == 0)
+        return send_headers(connfd, status, "text/html; charset=utf-8", 0, keep_alive);
+    return send_error(connfd, status, keep_alive);
+}
+
+// 응답 직후 바로 close하면, 아직 안 읽은 입력(이어 보낸 다음 요청, 거절한 큰 본문)이 소켓에 남아 있을 때
+// 커널이 FIN 대신 RST를 보내고, 클라이언트는 방금 받은 응답을 버릴 수 있다.
+// → 쓰기 방향만 먼저 닫고(FIN), 남은 입력을 잠깐(전체 최대 1초·4MB) 읽어 버린 뒤 close
+//   read 한 번마다의 타임아웃만 두면 1바이트씩 계속 보내는 클라이언트가 이 단계에서 워커를 붙잡으므로 전체 마감 시각도 둔다
+static void lingering_close(int fd) {
+    shutdown(fd, SHUT_WR);
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 200 * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    double end = rio_now() + 1.0;
+    char buf[4096];
+    size_t drained = 0;
+    while (drained < 4 * 1024 * 1024 && rio_now() < end) {
+        ssize_t r = read(fd, buf, sizeof(buf));
+        if (r == 0) break;                      // 클라이언트도 닫음
+        if (r < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;   // 마감 전이면 조금 더 기다림
+            break;
+        }
+        drained += (size_t)r;
+    }
+    close(fd);
+}
+
+void handle_connection(int connfd) {
+    rio_t rio;
     rio_readinitb(&rio, connfd);
 
-    // 수신 타임아웃: 연결만 하고 요청을 안 보내는 클라이언트가 이 스레드(1단계에선 서버 전체)와
-    // 종료(SIGINT/SIGTERM)를 무기한 막지 않도록, read가 KEEPALIVE_TIMEOUT_SEC 뒤 -1(EAGAIN)로 끝나게 한다
-    struct timeval tv = { .tv_sec = KEEPALIVE_TIMEOUT_SEC, .tv_usec = 0 };
-    setsockopt(connfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    // 수신 타임아웃: 다음 요청을 안 보내는 keep-alive 연결·아무것도 안 보내는 연결이 워커와 종료를 막지 않게
+    struct timeval rtv = { .tv_sec = KEEPALIVE_TIMEOUT_SEC, .tv_usec = 0 };
+    setsockopt(connfd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+    // 송신 타임아웃: 응답을 읽지 않는 클라이언트 때문에 큰 파일 전송(write)이 영원히 막히지 않게
+    struct timeval wtv = { .tv_sec = SEND_TIMEOUT_SEC, .tv_usec = 0 };
+    setsockopt(connfd, SOL_SOCKET, SO_SNDTIMEO, &wtv, sizeof(wtv));
 
-    // 1단계 임시: 요청 라인과 헤더를 빈 줄("\r\n")까지 읽고 버린 뒤 고정 응답을 보낸다
-    // 빈 줄까지 읽어야 하는 이유: 요청을 다 받기 전에 응답하고 닫으면 클라이언트가 RST를 받을 수 있음
-    while ((n = rio_readlineb(&rio, line, sizeof(line))) > 0) {
-        if (strcmp(line, "\r\n") == 0 || strcmp(line, "\n") == 0) break;
+    http_request req;
+    // keep-alive: 한 연결로 요청을 여러 번 받는다. 클라이언트가 닫거나·close를 원하거나·오류가 나거나·서버 종료 중이면 멈춤
+    while (!g_stop) {
+        int rc = read_request(&rio, &req);
+        if (rc < 0) break;                      // EOF, 유휴 시간 초과, 읽기 에러 → 응답 없이 종료
+        if (rc > 0) {                           // 형식 오류 등: 남은 입력의 경계를 믿을 수 없으므로 알려 주고 닫는다
+            reply_error(connfd, rc, NULL, 0);
+            break;
+        }
+
+        int keep = req.keep_alive && !g_stop;   // 종료 중이면 이번 응답에 Connection: close
+        req.keep_alive = keep;
+        int hr = dispatch(connfd, &req);
+        if (hr > 0 && reply_error(connfd, hr, &req, keep) != 0) hr = -1;
+        free_request(&req);
+        if (hr < 0 || !keep) break;
     }
 
-    if (n > 0) {
-        static const char resp[] =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: 13\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "Hello, W13!\r\n";
-        rio_writen(connfd, resp, sizeof(resp) - 1);   // 실패(EPIPE)해도 아래에서 닫으면 됨
-    }
-
-    close(connfd);                          // ← 빠뜨리면 fd 누수
+    lingering_close(connfd);                    // ← 어느 경로로 끝나든 여기서 닫는다 (fd 누수 방지)
 }
 
 void request_stop(void) {

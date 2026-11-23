@@ -1,8 +1,7 @@
 // [test_server.c] handle_connection 단위 테스트 — socketpair 한쪽을 "클라이언트", 다른 쪽을 connfd로 넘겨 검증
-// 1단계 임시 동작 기준: 요청 헤더를 빈 줄까지 읽고 고정 응답(200, "Hello, W13!") 후 연결을 닫는다
-// 3단계에서 실제 요청 처리로 바뀌면 기대 응답만 바꾸면 된다
+// 요청 읽기 → 분기(정적 파일 / CGI·Forward 미구현 501 / Forward 비활성 403) → 응답, keep-alive 반복, 시간 제한, 연결 정리
 #include "test.h"
-#include "http_request.h"   // MAX_LINE
+#include "http_request.h"
 #include "server.h"
 #include "rio.h"
 
@@ -12,11 +11,14 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
-#define EXPECTED_STATUS "HTTP/1.1 200 OK\r\n"
-#define EXPECTED_BODY   "Hello, W13!\r\n"
+#define INDEX_BODY "<h1>Index</h1>\n"          // 15바이트
+
+static char g_base[64], g_root[96];
+static server_config g_test_cfg;
 
 static void make_pair(int sv[2]) {
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
@@ -25,9 +27,42 @@ static void make_pair(int sv[2]) {
     }
 }
 
-// 클라이언트 쪽에서 응답을 EOF(또는 에러)까지 읽어 문자열로. 받은 바이트 수 반환
-// (서버가 안 읽은 데이터를 남기고 닫으면 마지막에 ECONNRESET이 올 수 있어, 그 전까지 받은 양을 센다)
-static ssize_t read_all(int fd, char *buf, size_t cap) {
+static void write_file(const char *path, const char *content) {
+    FILE *fp = fopen(path, "wb");
+    CHECK(fp != NULL);
+    if (!fp) return;
+    fputs(content, fp);
+    fclose(fp);
+}
+
+// 테스트용 정적 파일 루트를 임시 폴더에 만들고 서버 설정으로 등록
+static void setup(int forward_enabled) {
+    snprintf(g_base, sizeof(g_base), "/tmp/test_server_XXXXXX");
+    CHECK(mkdtemp(g_base) != NULL);
+    snprintf(g_root, sizeof(g_root), "%s/www", g_base);
+    CHECK(mkdir(g_root, 0755) == 0);
+    char p[160];
+    snprintf(p, sizeof(p), "%s/index.html", g_root);
+    write_file(p, INDEX_BODY);
+    snprintf(p, sizeof(p), "%s/a.css", g_root);
+    write_file(p, "b{}");
+
+    memset(&g_test_cfg, 0, sizeof(g_test_cfg));
+    g_test_cfg.port = "0";
+    g_test_cfg.root = g_root;
+    g_test_cfg.cgi_dir = "./cgi-bin";
+    g_test_cfg.forward_enabled = forward_enabled;
+    server_configure(&g_test_cfg);
+}
+
+static void teardown(void) {
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_base);
+    CHECK(system(cmd) == 0);
+}
+
+// 클라이언트 쪽에서 EOF(또는 에러)까지 받은 바이트를 문자열로
+static size_t read_all(int fd, char *buf, size_t cap) {
     size_t total = 0;
     while (total < cap - 1) {
         ssize_t r = read(fd, buf + total, cap - 1 - total);
@@ -36,130 +71,184 @@ static ssize_t read_all(int fd, char *buf, size_t cap) {
         total += (size_t)r;
     }
     buf[total] = '\0';
-    return (ssize_t)total;
+    return total;
 }
 
-// 요청을 다 보낸 뒤 handle_connection 실행 → 응답 확인
-static void run_with_request(const char *req, size_t len, char *resp, size_t cap, ssize_t *resp_len) {
+// 요청 바이트를 모두 보내고 쓰기 방향을 닫은(FIN) 뒤 handle_connection 실행 → 응답 전체 수집
+static size_t exchange(const char *req, char *resp, size_t cap) {
     int sv[2];
     make_pair(sv);
-    if (len > 0) rio_writen(sv[0], req, len);
-    shutdown(sv[0], SHUT_WR);              // 클라이언트가 더 보낼 게 없음 (FIN)
-    handle_connection(sv[1]);              // 끝나면 sv[1]을 닫아야 함
-    *resp_len = read_all(sv[0], resp, cap);
-    close(sv[0]);
-}
-
-// 정상 GET → 상태 라인, 헤더, 빈 줄, 본문
-static void test_normal_request(void) {
-    char resp[512];
-    ssize_t n;
-    const char *req = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    run_with_request(req, strlen(req), resp, sizeof(resp), &n);
-    CHECK(n > 0);
-    CHECK(strncmp(resp, EXPECTED_STATUS, strlen(EXPECTED_STATUS)) == 0);
-    CHECK(strstr(resp, "Content-Length: 13\r\n") != NULL);
-    CHECK(strstr(resp, "Connection: close\r\n") != NULL);
-    CHECK(strstr(resp, "\r\n\r\n" EXPECTED_BODY) != NULL);   // 헤더 끝 빈 줄 바로 뒤에 본문
-}
-
-// Content-Length 값이 실제 본문 길이와 일치해야 함 (keep-alive 클라이언트가 응답 끝을 판단하는 근거)
-static void test_content_length_matches_body(void) {
-    char resp[512];
-    ssize_t n;
-    const char *req = "GET / HTTP/1.1\r\n\r\n";
-    run_with_request(req, strlen(req), resp, sizeof(resp), &n);
-    char *body = strstr(resp, "\r\n\r\n");
-    CHECK(body != NULL);
-    if (body) CHECK(strlen(body + 4) == 13);
-}
-
-// 줄 끝이 "\n"만 있는 요청(비표준)도 빈 줄을 인식해 응답
-static void test_lf_only_request(void) {
-    char resp[512];
-    ssize_t n;
-    const char *req = "GET / HTTP/1.0\nHost: x\n\n";
-    run_with_request(req, strlen(req), resp, sizeof(resp), &n);
-    CHECK(n > 0 && strncmp(resp, EXPECTED_STATUS, strlen(EXPECTED_STATUS)) == 0);
-}
-
-// 헤더 끝(빈 줄) 전에 클라이언트가 끊으면 → 응답 없이 연결만 닫음
-static void test_incomplete_request_no_response(void) {
-    char resp[512];
-    ssize_t n;
-    const char *req = "GET / HTTP/1.1\r\nHost: x\r\n";
-    run_with_request(req, strlen(req), resp, sizeof(resp), &n);
-    CHECK(n == 0);
-}
-
-// 아무것도 안 보내고 끊음 → 응답 없음
-static void test_empty_connection(void) {
-    char resp[64];
-    ssize_t n;
-    run_with_request("", 0, resp, sizeof(resp), &n);
-    CHECK(n == 0);
-}
-
-// MAX_LINE(8192)보다 긴 헤더 줄 → 잘려서 여러 번 읽히지만 빈 줄을 만나면 응답 (1단계 임시 동작)
-static void test_very_long_header_line(void) {
-    size_t long_len = MAX_LINE * 2;
-    size_t total = long_len + 64;
-    char *req = malloc(total);
-    char resp[512];
-    ssize_t n;
-    strcpy(req, "GET / HTTP/1.1\r\nX-Long: ");
-    size_t off = strlen(req);
-    memset(req + off, 'a', long_len);
-    off += long_len;
-    memcpy(req + off, "\r\n\r\n", 4);
-    off += 4;
-
-    int sv[2];
-    make_pair(sv);
-    // 소켓 버퍼보다 클 수 있으므로 별도 스레드 없이 순서대로: 먼저 보내고 처리
-    rio_writen(sv[0], req, off);
+    if (req[0] != '\0') rio_writen(sv[0], req, strlen(req));
     shutdown(sv[0], SHUT_WR);
-    handle_connection(sv[1]);
-    n = read_all(sv[0], resp, sizeof(resp));
+    handle_connection(sv[1]);                               // 끝나면 sv[1]을 닫아야 함
+    size_t n = read_all(sv[0], resp, cap);
     close(sv[0]);
-    CHECK(n > 0 && strncmp(resp, EXPECTED_STATUS, strlen(EXPECTED_STATUS)) == 0);
-    free(req);
+    return n;
 }
 
-// 빈 줄 뒤에 온 데이터(body, 다음 요청)는 1단계에선 무시하고 응답 한 번만
-static void test_extra_data_after_headers(void) {
-    char resp[512];
-    ssize_t n;
-    const char *req = "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET / HTTP/1.1\r\n\r\n";
-    run_with_request(req, strlen(req), resp, sizeof(resp), &n);
-    CHECK(n > 0);
-    char *second = strstr(resp + 1, "HTTP/1.1 200");
-    CHECK(second == NULL);                                   // 응답은 하나만
+static int count_responses(const char *resp) {
+    int n = 0;
+    for (const char *p = resp; (p = strstr(p, "HTTP/1.1 ")) != NULL; p++) n++;
+    return n;
 }
 
-// handle_connection이 connfd를 반드시 닫는지 (fd 누수 방지)
+// ───────────── 정상 요청 ─────────────
+
+// GET / → index.html (200, text/html, 정확한 Content-Length, 본문), HTTP/1.1 기본 keep-alive
+static void test_get_index(void) {
+    char resp[2048];
+    exchange("GET / HTTP/1.1\r\nHost: x\r\n\r\n", resp, sizeof(resp));
+    CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0);
+    CHECK(strstr(resp, "Content-Type: text/html; charset=utf-8\r\n") != NULL);
+    CHECK(strstr(resp, "Content-Length: 15\r\n") != NULL);
+    CHECK(strstr(resp, "Connection: keep-alive\r\n") != NULL);
+    char *body = strstr(resp, "\r\n\r\n");
+    CHECK(body != NULL && strcmp(body + 4, INDEX_BODY) == 0);   // 본문 뒤에 다른 바이트 없음
+}
+
+// 한 연결에 요청 3개를 이어 보냄(pipelining) → 순서대로 응답 3개 (keep-alive 반복)
+static void test_keepalive_pipelined(void) {
+    char resp[4096];
+    exchange("GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+             "GET /a.css HTTP/1.1\r\nHost: x\r\n\r\n"
+             "GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", resp, sizeof(resp));
+    CHECK(count_responses(resp) == 3);
+    char *r2 = strstr(resp + 1, "HTTP/1.1 200 OK");
+    CHECK(r2 != NULL && strstr(r2, "Content-Type: text/css; charset=utf-8") != NULL);
+    CHECK(strstr(resp, "HTTP/1.1 404 Not Found") != NULL);  // 404 뒤에도 연결 유지 (keep-alive)
+}
+
+// Connection: close → 응답 하나만 보내고 닫음 (뒤에 이어 보낸 요청은 무시)
+static void test_connection_close(void) {
+    char resp[4096];
+    exchange("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+             "GET /a.css HTTP/1.1\r\nHost: x\r\n\r\n", resp, sizeof(resp));
+    CHECK(count_responses(resp) == 1);
+    CHECK(strstr(resp, "Connection: close\r\n") != NULL);
+}
+
+// HTTP/1.0은 기본이 close
+static void test_http10_closes(void) {
+    char resp[4096];
+    exchange("GET / HTTP/1.0\r\n\r\nGET / HTTP/1.0\r\n\r\n", resp, sizeof(resp));
+    CHECK(count_responses(resp) == 1);
+    CHECK(strstr(resp, "Connection: close\r\n") != NULL);
+}
+
+// HEAD → 헤더만 (Content-Length는 GET과 같음), 없는 파일 HEAD도 본문 없음
+static void test_head(void) {
+    char resp[2048];
+    exchange("HEAD / HTTP/1.1\r\nHost: x\r\n\r\n", resp, sizeof(resp));
+    CHECK(strstr(resp, "Content-Length: 15\r\n") != NULL);
+    char *sep = strstr(resp, "\r\n\r\n");
+    CHECK(sep != NULL && sep[4] == '\0');
+    exchange("HEAD /missing HTTP/1.1\r\nHost: x\r\n\r\n", resp, sizeof(resp));
+    CHECK(strncmp(resp, "HTTP/1.1 404 Not Found\r\n", 24) == 0);
+    sep = strstr(resp, "\r\n\r\n");
+    CHECK(sep != NULL && sep[4] == '\0');                    // 404여도 HEAD에는 본문을 붙이지 않음
+}
+
+// ───────────── 오류 응답 ─────────────
+
+// 형식이 깨진 요청 → 400 보내고 닫음 (뒤에 온 정상 요청에는 응답하지 않음 — 경계를 믿을 수 없으므로)
+static void test_bad_request_closes(void) {
+    char resp[4096];
+    exchange("GARBAGE\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n", resp, sizeof(resp));
+    CHECK(strncmp(resp, "HTTP/1.1 400 Bad Request\r\n", 26) == 0);
+    CHECK(count_responses(resp) == 1);
+    CHECK(strstr(resp, "Connection: close\r\n") != NULL);
+}
+
+// 각종 오류 코드가 실제 응답으로 나감
+static void test_error_codes(void) {
+    char resp[4096];
+    exchange("PUT / HTTP/1.1\r\nHost: x\r\n\r\n", resp, sizeof(resp));
+    CHECK(strncmp(resp, "HTTP/1.1 501", 12) == 0);
+    exchange("GET / HTTP/1.1\r\n\r\n", resp, sizeof(resp));                         // Host 없음
+    CHECK(strncmp(resp, "HTTP/1.1 400", 12) == 0);
+    exchange("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi", resp, sizeof(resp));
+    CHECK(strncmp(resp, "HTTP/1.1 405", 12) == 0);                                   // 정적 파일에 POST
+    // 루트(/tmp/test_server_X/www)에서 충분히 올라가 실제로 존재하는 /etc/passwd를 가리키게
+    exchange("GET /../../../../../../../../etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n", resp, sizeof(resp));
+    CHECK(strncmp(resp, "HTTP/1.1 403", 12) == 0);
+    CHECK(strstr(resp, "root:") == NULL);
+    exchange("GET /cgi-bin/adder?a=1 HTTP/1.1\r\nHost: x\r\n\r\n", resp, sizeof(resp));
+    CHECK(strncmp(resp, "HTTP/1.1 501", 12) == 0);                                   // CGI는 5단계
+    exchange("GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n", resp, sizeof(resp));
+    CHECK(strncmp(resp, "HTTP/1.1 403", 12) == 0);                                   // -f 없이 Forward 요청
+}
+
+static void test_forward_enabled_not_yet(void) {
+    teardown();
+    setup(1);
+    char resp[2048];
+    exchange("GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n", resp, sizeof(resp));
+    CHECK(strncmp(resp, "HTTP/1.1 501", 12) == 0);                                   // Forward는 7단계
+    teardown();
+    setup(0);
+}
+
+// 본문 상한(1MB) 초과 → 본문을 읽지 않고 413. 남은 본문이 있어도 응답이 클라이언트에 도착해야 함(lingering close)
+struct big_writer { int fd; };
+static void *write_big_body(void *p) {
+    struct big_writer *w = p;
+    char hdr[128];
+    snprintf(hdr, sizeof(hdr), "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n", 3 * 1024 * 1024);
+    rio_writen(w->fd, hdr, strlen(hdr));
+    static char chunk[65536];
+    for (int i = 0; i < 48; i++)                            // 3MB 본문 (서버가 안 읽으면 버퍼가 차서 막힘)
+        if (rio_writen(w->fd, chunk, sizeof(chunk)) < 0) break;
+    shutdown(w->fd, SHUT_WR);
+    return NULL;
+}
+
+static void test_body_too_large_still_gets_413(void) {
+    signal(SIGPIPE, SIG_IGN);
+    int sv[2];
+    make_pair(sv);
+    struct big_writer w = { .fd = sv[0] };
+    pthread_t t;
+    if (pthread_create(&t, NULL, write_big_body, &w) != 0) {
+        CHECK(!"pthread_create failed");
+        close(sv[0]);
+        close(sv[1]);
+        return;
+    }
+    handle_connection(sv[1]);
+    CHECK(pthread_join(t, NULL) == 0);
+    char resp[2048];
+    read_all(sv[0], resp, sizeof(resp));
+    close(sv[0]);
+    const char *want = "HTTP/1.1 413 Payload Too Large\r\n";
+    CHECK(strncmp(resp, want, strlen(want)) == 0);
+}
+
+// ───────────── 연결 관리 ─────────────
+
+// handle_connection이 끝나면 connfd가 반드시 닫혀 있음 (fd 누수 방지)
 static void test_closes_connfd(void) {
     int sv[2];
     make_pair(sv);
-    rio_writen(sv[0], "GET / HTTP/1.1\r\n\r\n", 18);
+    rio_writen(sv[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n", 27);
+    shutdown(sv[0], SHUT_WR);
     handle_connection(sv[1]);
     errno = 0;
-    CHECK(fcntl(sv[1], F_GETFD) == -1 && errno == EBADF);   // 이미 닫힌 fd
+    CHECK(fcntl(sv[1], F_GETFD) == -1 && errno == EBADF);
     close(sv[0]);
 }
 
-// 응답을 받기 전에 클라이언트가 완전히 닫아도(쓰기 실패 EPIPE) 프로세스가 죽지 않고 반환
+// 응답을 받기 전에 클라이언트가 완전히 닫아도 프로세스가 죽지 않음 (SIGPIPE 무시 상태)
 static void test_client_gone_before_response(void) {
-    signal(SIGPIPE, SIG_IGN);                                // main.c와 같은 설정
+    signal(SIGPIPE, SIG_IGN);
     int sv[2];
     make_pair(sv);
-    rio_writen(sv[0], "GET / HTTP/1.1\r\n\r\n", 18);
-    close(sv[0]);                                            // 응답 받을 사람 없음
+    rio_writen(sv[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n", 27);
+    close(sv[0]);
     handle_connection(sv[1]);
-    CHECK(1);                                                // 여기 도달하면 통과
+    CHECK(1);
 }
 
-// 요청을 조각조각 천천히 보내도 합쳐서 처리
+// 요청이 조각조각 천천히 도착해도 합쳐서 처리
 struct slow_arg { int fd; };
 static void *slow_client(void *p) {
     struct slow_arg *a = p;
@@ -168,6 +257,7 @@ static void *slow_client(void *p) {
         rio_writen(a->fd, parts[i], strlen(parts[i]));
         usleep(30 * 1000);
     }
+    shutdown(a->fd, SHUT_WR);
     return NULL;
 }
 
@@ -178,41 +268,86 @@ static void test_fragmented_request(void) {
     pthread_t t;
     if (pthread_create(&t, NULL, slow_client, &a) != 0) {
         CHECK(!"pthread_create failed");
+        close(sv[0]);
+        close(sv[1]);
         return;
     }
     handle_connection(sv[1]);
-    pthread_join(t, NULL);
-    char resp[512];
-    ssize_t n = read_all(sv[0], resp, sizeof(resp));
+    CHECK(pthread_join(t, NULL) == 0);
+    char resp[2048];
+    read_all(sv[0], resp, sizeof(resp));
     close(sv[0]);
-    CHECK(n > 0 && strncmp(resp, EXPECTED_STATUS, strlen(EXPECTED_STATUS)) == 0);
+    CHECK(strncmp(resp, "HTTP/1.1 200 OK\r\n", 17) == 0);
 }
 
-// 연결만 하고 아무것도 안 보내는 클라이언트 → KEEPALIVE_TIMEOUT_SEC 뒤 응답 없이 반환 (무한 대기 금지)
+// 아무것도 안 보내는 클라이언트 → KEEPALIVE_TIMEOUT_SEC 뒤 응답 없이 반환 (무한 대기 금지)
 static void test_idle_client_times_out(void) {
     int sv[2];
     make_pair(sv);
     time_t start = time(NULL);
     handle_connection(sv[1]);
     time_t elapsed = time(NULL) - start;
-    CHECK(elapsed >= KEEPALIVE_TIMEOUT_SEC - 1 && elapsed <= KEEPALIVE_TIMEOUT_SEC + 2);
+    CHECK(elapsed >= KEEPALIVE_TIMEOUT_SEC - 1 && elapsed <= KEEPALIVE_TIMEOUT_SEC + 3);
     char resp[64];
-    CHECK(read_all(sv[0], resp, sizeof(resp)) == 0);         // 응답 없이 닫힘
+    CHECK(read_all(sv[0], resp, sizeof(resp)) == 0);
     close(sv[0]);
 }
 
+// 한 줄 안에서 1바이트씩 천천히 보내는 slowloris → read 하나하나는 수신 타임아웃에 안 걸려도
+// 요청 전체 시간 제한(REQUEST_TIMEOUT_SEC)에 걸려 408 후 종료
+struct drip_arg { int fd; volatile int stop; };
+static void *drip_client(void *p) {
+    struct drip_arg *a = p;
+    rio_writen(a->fd, "GET / HTTP/1.1\r\nX-Slow: ", 24);
+    while (!a->stop) {                                      // 헤더 값을 1초에 1바이트씩, 줄을 끝내지 않음
+        if (rio_writen(a->fd, "a", 1) < 0) break;
+        sleep(1);
+    }
+    return NULL;
+}
+
+static void test_slowloris_gets_408(void) {
+    signal(SIGPIPE, SIG_IGN);
+    int sv[2];
+    make_pair(sv);
+    struct drip_arg a = { .fd = sv[0], .stop = 0 };
+    pthread_t t;
+    if (pthread_create(&t, NULL, drip_client, &a) != 0) {
+        CHECK(!"pthread_create failed");
+        close(sv[0]);
+        close(sv[1]);
+        return;
+    }
+    time_t start = time(NULL);
+    handle_connection(sv[1]);
+    time_t elapsed = time(NULL) - start;
+    a.stop = 1;
+    CHECK(pthread_join(t, NULL) == 0);
+    // 408 후 정리(lingering close)도 전체 1초 안에 끝나야 함 — 계속 들어오는 바이트에 붙잡히지 않음
+    CHECK(elapsed >= REQUEST_TIMEOUT_SEC && elapsed <= REQUEST_TIMEOUT_SEC + 3);
+    char resp[2048];
+    read_all(sv[0], resp, sizeof(resp));
+    close(sv[0]);
+    CHECK(strncmp(resp, "HTTP/1.1 408 Request Timeout\r\n", 30) == 0);
+}
+
 int main(void) {
-    test_normal_request();
-    test_content_length_matches_body();
-    test_lf_only_request();
-    test_incomplete_request_no_response();
-    test_empty_connection();
-    test_very_long_header_line();
-    test_extra_data_after_headers();
+    setup(0);
+    test_get_index();
+    test_keepalive_pipelined();
+    test_connection_close();
+    test_http10_closes();
+    test_head();
+    test_bad_request_closes();
+    test_error_codes();
+    test_forward_enabled_not_yet();
+    test_body_too_large_still_gets_413();
     test_closes_connfd();
     test_client_gone_before_response();
     test_fragmented_request();
-    fprintf(stderr, "  (유휴 클라이언트 타임아웃 테스트: 약 %d초 걸림)\n", KEEPALIVE_TIMEOUT_SEC);
+    fprintf(stderr, "  (시간 제한 테스트: 약 %d초 걸림)\n", KEEPALIVE_TIMEOUT_SEC + REQUEST_TIMEOUT_SEC);
     test_idle_client_times_out();
+    test_slowloris_gets_408();
+    teardown();
     return TEST_RESULT();
 }

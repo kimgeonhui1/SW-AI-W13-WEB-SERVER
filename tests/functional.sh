@@ -73,15 +73,35 @@ done
 echo "== 2. 기본 응답"
 start_server && ok "서버 시작" || { bad "서버 시작" "$(cat "$LOG")"; exit 1; }
 
-resp=$(curl -s -i "http://127.0.0.1:$PORT/" | tr -d '\r')
-expect_eq "상태 라인" "$(echo "$resp" | head -1)" "HTTP/1.1 200 OK"
-echo "$resp" | grep -q '^Content-Type: text/plain$' && ok "Content-Type 헤더" || bad "Content-Type 헤더" "$resp"
-echo "$resp" | grep -q '^Content-Length: 13$' && ok "Content-Length 헤더" || bad "Content-Length 헤더" "$resp"
-echo "$resp" | grep -q '^Connection: close$' && ok "Connection 헤더" || bad "Connection 헤더" "$resp"
-expect_eq "본문 (CRLF로 끝남)" "$(curl -s "http://127.0.0.1:$PORT/" | od -An -c | tr -s ' ' | tr -d '\n')" " H e l l o , W 1 3 ! \r \n"
-expect_eq "HTTP/1.0 요청" "$(curl -s -0 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")" "200"
-expect_eq "POST 요청" "$(curl -s -o /dev/null -w '%{http_code}' -d 'a=1' "http://127.0.0.1:$PORT/")" "200"
+U="http://127.0.0.1:$PORT"
+resp=$(curl -s -i "$U/" | tr -d '\r')
+expect_eq "GET / 상태 라인" "$(echo "$resp" | head -1)" "HTTP/1.1 200 OK"
+echo "$resp" | grep -q '^Content-Type: text/html; charset=utf-8$' && ok "Content-Type text/html" || bad "Content-Type" "$resp"
+echo "$resp" | grep -q "^Content-Length: $(wc -c < www/index.html)$" && ok "Content-Length = 파일 크기" || bad "Content-Length" "$resp"
+echo "$resp" | grep -q '^Connection: keep-alive$' && ok "HTTP/1.1 기본 keep-alive" || bad "Connection" "$resp"
+curl -s "$U/" | cmp -s - www/index.html && ok "본문 = www/index.html (바이트 동일)" || bad "본문" "다름"
+curl -s "$U/index.html" | cmp -s - www/index.html && ok "/index.html 직접 요청" || bad "/index.html" "다름"
+expect_eq "CSS Content-Type" "$(curl -s -o /dev/null -w '%{content_type}' "$U/style.css")" "text/css; charset=utf-8"
+expect_eq "JS Content-Type" "$(curl -s -o /dev/null -w '%{content_type}' "$U/app.js")" "application/javascript; charset=utf-8"
+expect_eq "쿼리스트링 무시하고 파일 서빙" "$(curl -s -o /dev/null -w '%{http_code}' "$U/style.css?v=1")" "200"
+expect_eq "없는 파일 → 404" "$(curl -s -o /dev/null -w '%{http_code}' "$U/nope.html")" "404"
+expect_eq "루트 탈출 ../ → 403" "$(curl -s --path-as-is -o /dev/null -w '%{http_code}' "$U/../Makefile")" "403"
+expect_eq "정적 파일에 POST → 405" "$(curl -s -o /dev/null -w '%{http_code}' -d 'a=1' "$U/")" "405"
+expect_eq "CGI 경로 (5단계 전) → 501" "$(curl -s -o /dev/null -w '%{http_code}' "$U/cgi-bin/adder?a=1&b=2")" "501"
+expect_eq "Forward 요청, -f 없음 → 403" "$(curl -s -o /dev/null -w '%{http_code}' -x "127.0.0.1:$PORT" http://example.com/)" "403"
+head_out=$(curl -s -I "$U/" | tr -d '\r')
+echo "$head_out" | grep -q "^Content-Length: $(wc -c < www/index.html)$" && ok "HEAD: 헤더만, 길이는 GET과 같음" || bad "HEAD" "$head_out"
+r10=$(curl -s -0 -i "$U/" | tr -d '\r')
+echo "$r10" | grep -q '^Connection: close$' && ok "HTTP/1.0 → Connection: close" || bad "HTTP/1.0" "$r10"
+# curl 로그 문구는 버전마다 달라서, 전송별 "새로 맺은 연결 수"로 판정 (두 번째가 0이면 재사용)
+conns=$(curl -s -o /dev/null -o /dev/null -w '%{num_connects} ' "$U/" "$U/style.css")
+expect_eq "keep-alive: 두 번째 요청이 같은 연결 재사용 (새 연결 수)" "$conns" "1 0 "
 expect_eq "localhost 이름으로 접속" "$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT/")" "200"
+bigf=$(mktemp)
+head -c 3000000 /dev/zero > "$bigf"
+expect_eq "본문 3MB(상한 1MB 초과) → 413 응답이 실제로 도착" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H 'Expect:' --data-binary @"$bigf" "$U/")" "413"
+rm -f "$bigf"
 
 # ───────────── 3. 비정상 클라이언트 ─────────────
 echo "== 3. 비정상 클라이언트 (서버가 죽지 않고 다음 요청을 처리해야 함)"
@@ -103,7 +123,9 @@ expect_eq "응답 안 읽고 끊기 30회(SIGPIPE) 뒤" "$(curl -s -o /dev/null 
 
 long=$(head -c 20000 /dev/zero | tr '\0' 'a')
 got=$(printf 'GET / HTTP/1.1\r\nX-Long: %s\r\n\r\n' "$long" | nc -q 1 127.0.0.1 "$PORT" | head -1 | tr -d '\r')
-expect_eq "20KB 헤더 줄 (1단계는 잘라 읽고 응답)" "$got" "HTTP/1.1 200 OK"
+expect_eq "20KB 헤더 줄 → 431" "$got" "HTTP/1.1 431 Request Header Fields Too Large"
+got=$(printf 'GARBAGE\r\n\r\n' | nc -q 1 127.0.0.1 "$PORT" | head -1 | tr -d '\r')
+expect_eq "깨진 요청 라인 → 400" "$got" "HTTP/1.1 400 Bad Request"
 
 head -c 100000 /dev/urandom | nc -q 1 127.0.0.1 "$PORT" >/dev/null 2>&1
 expect_eq "100KB 쓰레기 바이트 뒤" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")" "200"

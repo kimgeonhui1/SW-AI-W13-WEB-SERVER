@@ -1,9 +1,10 @@
 // [forward_proxy.c] Forward Proxy 구현
 #include "forward_proxy.h"
 
+#include <strings.h>
+
 int is_absolute_uri(const char *uri) {
-    (void)uri;
-    return 0; // TODO: strncasecmp(uri, "http://", 7) == 0
+    return uri != NULL && strncasecmp(uri, "http://", 7) == 0;   // 스킴은 대소문자 무시 (RFC 3986)
 }
 
 int parse_absolute_uri(const char *uri, char *host, size_t hostlen,
