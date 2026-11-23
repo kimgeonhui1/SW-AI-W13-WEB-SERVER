@@ -32,7 +32,11 @@ int main(void) {
     const char *method = getenv("REQUEST_METHOD");
     if (method != NULL && strcmp(method, "POST") == 0) {
         const char *cl = getenv("CONTENT_LENGTH");
-        long want = (cl != NULL) ? strtol(cl, NULL, 10) : 0;
+        // 서버 밖에서 직접 실행될 수도 있으므로 환경변수를 믿지 않는다: 숫자만, 범위 안
+        char *end = NULL;
+        errno = 0;
+        long want = (cl != NULL) ? strtol(cl, &end, 10) : -1;
+        if (cl == NULL || end == cl || *end != '\0' || errno == ERANGE) { bad_request("bad CONTENT_LENGTH"); return 0; }
         if (want < 0 || want > ADDER_MAX_INPUT) { bad_request("body too large"); return 0; }
         size_t got = 0;
         while (got < (size_t)want) {                         // 파이프는 나눠서 올 수 있으므로 다 받을 때까지

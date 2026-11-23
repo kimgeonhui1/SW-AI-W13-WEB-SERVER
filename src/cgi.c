@@ -81,6 +81,9 @@ static int parse_cgi_output(char *out, size_t len, int *status, char *ctype, siz
         while (*val == ' ' || *val == '\t') val++;
         if (strcasecmp(line, "Content-Type") == 0) {
             if (strlen(val) >= ctype_cap || val[0] == '\0') return -1;
+            // 제어 문자(줄 중간의 CR 등)가 섞이면 응답 헤더를 깨뜨린다 → 연결을 끊지 말고 502로 거절
+            for (const char *c = val; *c; c++)
+                if (((unsigned char)*c < 0x20 && *c != '\t') || *c == 0x7f) return -1;
             snprintf(ctype, ctype_cap, "%s", val);
         } else if (strcasecmp(line, "Status") == 0) {
             char *e = NULL;

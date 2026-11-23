@@ -102,6 +102,15 @@ expect_eq "정적 파일에 POST → 405" "$(curl -s -o /dev/null -w '%{http_cod
 expect_eq "CGI GET adder" "$(curl -s "$U/cgi-bin/adder?a=1&b=2")" "1 + 2 = 3"
 expect_eq "CGI POST adder (본문 → 표준 입력)" "$(curl -s -d 'a=40&b=2' "$U/cgi-bin/adder")" "40 + 2 = 42"
 expect_eq "CGI Status 헤더 반영 (잘못된 입력 → 400)" "$(curl -s -o /dev/null -w '%{http_code}' "$U/cgi-bin/adder?a=x&b=2")" "400"
+head_cgi=$(curl -s -I "$U/cgi-bin/adder?a=1&b=2" | tr -d '\r')
+# 응답이 빈 줄(\r\n\r\n)로 끝나야 본문이 없는 것 ($(...)는 끝 줄바꿈을 지우므로 마지막 4바이트를 16진수로 비교)
+tail4=$(printf 'HEAD /cgi-bin/adder?a=1&b=2 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | nc -q 2 127.0.0.1 "$PORT" | tail -c 4 | od -An -tx1 | tr -d ' \n')
+echo "$head_cgi" | grep -q '^Content-Length: 10$' && [ "$tail4" = "0d0a0d0a" ] \
+    && ok "CGI HEAD: 본문 없음, Content-Length는 GET과 같음" || bad "CGI HEAD" "$head_cgi"
+for cl in 10abc 99999999999999999999 -1 ""; do
+    got=$(CONTENT_LENGTH="$cl" REQUEST_METHOD=POST ./cgi-bin/adder </dev/null | head -1 | tr -d '\r')
+    expect_eq "adder 단독 실행, 잘못된 CONTENT_LENGTH='$cl' → 400" "$got" "Status: 400 Bad Request"
+done
 expect_eq "없는 CGI → 404" "$(curl -s -o /dev/null -w '%{http_code}' "$U/cgi-bin/nope")" "404"
 expect_eq "CGI 하위 경로 탈출 → 404" "$(curl -s --path-as-is -o /dev/null -w '%{http_code}' "$U/cgi-bin/../Makefile")" "404"
 expect_eq "CGI Content-Length 있음" "$(curl -s -o /dev/null -w '%{size_download}' "$U/cgi-bin/adder?a=1&b=2")" "10"

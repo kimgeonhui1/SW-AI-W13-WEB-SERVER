@@ -170,7 +170,10 @@ static void test_bad_output(void) {
     write_script("nocolon", "printf 'garbage\\n\\nbody'\n", 0755);
     make_req("GET", "/cgi-bin/nocolon", "", NULL);
     CHECK(run() == 502);
-    write_script("fail", "printf 'Content-Type: text/plain\\n\\nx'; exit 1\n", 0755);   // 비정상 종료
+    write_script("ctcr", "printf 'Content-Type: text/plain\\rX-Evil: 1\\n\\nbody'\n", 0755);   // 값 중간의 CR
+    make_req("GET", "/cgi-bin/ctcr", "", NULL);
+    CHECK(run() == 502);
+    write_script("fail","printf 'Content-Type: text/plain\\n\\nx'; exit 1\n", 0755);   // 비정상 종료
     make_req("GET", "/cgi-bin/fail", "", NULL);
     CHECK(run() == 502);
     CHECK(g_resp_len == 0);                                // 오류 코드 반환 시 serve_cgi는 아무것도 안 보냄
