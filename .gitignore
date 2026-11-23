@@ -58,3 +58,6 @@ dkms.conf
 bin/
 build/
 cgi-bin/adder
+
+# Editor settings (personal)
+.vscode/
