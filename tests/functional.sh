@@ -15,7 +15,19 @@ PID=
 ok()   { echo "  ok   $1"; PASS=$((PASS + 1)); }
 bad()  { echo "  FAIL $1 — $2"; FAIL=$((FAIL + 1)); }
 expect_eq() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "기대 '$3', 실제 '$2'"; fi; }
-now_ms() { date +%s%3N; }
+# 경과 시간은 부팅 후 시간(/proc/uptime, 거꾸로 가지 않음)으로 잰다.
+# date(시스템 시계)는 WSL2가 Windows 시계와 맞추며 뒤로 갈 수 있어 음수 경과 시간이 나와 "빠름" 검사를 잘못 통과시켰다
+now_ms() { awk '{ printf "%d", $1 * 1000 }' /proc/uptime; }
+# URL이 200을 줄 때까지 최대 $2초 재시도하고 마지막 상태 코드를 출력 (고정 sleep 대신 조건이 될 때까지 대기)
+until_200() {
+    local code=000
+    for _ in $(seq $(( $2 * 5 ))); do
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$1")
+        [ "$code" = 200 ] && break
+        sleep 0.2
+    done
+    echo "$code"
+}
 
 start_server() {
     "$SERVER" -p "$PORT" "$@" >"$LOG" 2>&1 &
@@ -151,16 +163,16 @@ for _ in $(seq 100); do curl -s -o /dev/null "http://127.0.0.1:$PORT/"; done
 expect_eq "fd 개수 변화 없음" "$(ls /proc/"$PID"/fd | wc -l)" "$fds_before"
 
 # ───────────── 6. 유휴 클라이언트 / 타임아웃 ─────────────
-echo "== 6. 유휴 클라이언트 (수신 타임아웃 5초)"
-sleep 15 | nc 127.0.0.1 "$PORT" >/dev/null &
-NCPID=$!
+echo "== 6. 유휴 클라이언트 · 동시 처리 (스레드 풀)"
+NCPIDS=()
+for _ in 1 2 3; do nc -d 127.0.0.1 "$PORT" >/dev/null & NCPIDS+=($!); done   # 워커 3개를 붙잡는 유휴 연결
 sleep 0.3
 t0=$(now_ms)
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:$PORT/")
 elapsed=$(( $(now_ms) - t0 ))
-expect_eq "유휴 클라이언트 뒤 요청도 처리됨" "$code" "200"
-[ "$elapsed" -ge 3500 ] && [ "$elapsed" -le 7000 ] && ok "대기 시간 약 5초 (${elapsed}ms)" || bad "대기 시간" "${elapsed}ms"
-kill "$NCPID" 2>/dev/null
+expect_eq "유휴 연결 3개가 있어도 다른 요청 처리됨" "$code" "200"
+[ "$elapsed" -le 1000 ] && ok "기다리지 않고 바로 응답 (${elapsed}ms, 다른 워커가 처리)" || bad "응답 지연" "${elapsed}ms"
+kill "${NCPIDS[@]}" 2>/dev/null
 
 # 요청 라인만 보내고 멈춤 → 요청 도중의 타임아웃이므로 조용히 끊지 않고 408
 got=$({ printf 'GET / HTTP/1.1\r\n'; sleep 8; } | nc -q 1 127.0.0.1 "$PORT" | head -1 | tr -d '\r')
@@ -191,7 +203,7 @@ kill -TERM "$PID"; wait_exit 10; rc=$?
 expect_eq "SIGTERM → exit 0" "$rc" "0"
 
 start_server
-sleep 15 | nc 127.0.0.1 "$PORT" >/dev/null &
+nc -d 127.0.0.1 "$PORT" >/dev/null &
 NCPID=$!
 sleep 0.3
 t0=$(now_ms)
@@ -209,34 +221,92 @@ expect_eq "시그널 연속 3번 → exit 0" "$rc" "0"
 expect_eq "종료 후 새 연결은 거부됨" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PORT/")" "000"
 
 # ───────────── 9. 종료 시그널 경쟁 조건 (플래그 확인 ~ 대기 시작 사이) ─────────────
-# 훅 없이 그 틈을 정확히 맞출 수는 없으므로, 틈이 원리적으로 없는지를 결정적으로 검증한다:
-#   (a) 대기(pselect) 중에는 SIGINT/SIGTERM이 열려 있고
-#   (b) 그 밖(연결 처리 중)에서는 막혀 있어서, 그때 온 시그널은 사라지지 않고 보류된 뒤
-#   (c) 다음 대기 진입 순간 바로 처리되어 종료된다
-echo "== 9. 종료 시그널 경쟁 조건"
+# 훅 없이 그 틈을 정확히 맞출 수는 없으므로, 틈이 원리적으로 없는지를 시그널 마스크로 결정적으로 검증한다
+echo "== 9. 종료 시그널 경쟁 조건 · 시그널을 받는 스레드"
 mask_of() { awk -v k="$2:" '$1 == k { print $2 }' /proc/"$1"/status; }
 has_bits() { [ $(( 0x$1 & 0x4002 )) -eq $(( 0x4002 )) ]; }  # SIGINT(2) → bit1, SIGTERM(15) → bit14
 
+# 스레드 풀 구조에서의 기대:
+#   (a) 메인 스레드는 pselect 대기 중이므로 SIGINT/SIGTERM이 열려 있고
+#   (b) 워커 스레드들은 모두 막고 있어서 시그널이 처리 중인 워커로 가지 않는다
+#   (c) 연결 처리 중에 SIGINT → 메인이 바로 받아 새 연결을 막고, 워커가 그 연결을 끝내면 종료
+task_mask() { awk -v k="$2:" '$1 == k { print $2 }' /proc/"$1"/task/"$3"/status; }
+
 start_server
 blk=$(mask_of "$PID" SigBlk)
-has_bits "$blk" && bad "(a) 대기 중엔 SIGINT/SIGTERM 허용" "SigBlk=$blk" || ok "(a) 대기 중엔 SIGINT/SIGTERM 허용 (SigBlk=$blk)"
+has_bits "$blk" && bad "(a) 메인 스레드는 대기 중 SIGINT/SIGTERM 허용" "SigBlk=$blk" || ok "(a) 메인 스레드는 대기 중 SIGINT/SIGTERM 허용 (SigBlk=$blk)"
+nworkers=0; unblocked=0
+for tid in $(ls /proc/"$PID"/task); do
+    [ "$tid" = "$PID" ] && continue
+    nworkers=$((nworkers + 1))
+    has_bits "$(task_mask "$PID" SigBlk "$tid")" || unblocked=$((unblocked + 1))
+done
+expect_eq "(b) 워커 스레드 수 (-t 기본 8)" "$nworkers" "8"
+expect_eq "(b) SIGINT/SIGTERM을 받을 수 있는 워커 수" "$unblocked" "0"
 
-sleep 15 | nc 127.0.0.1 "$PORT" >/dev/null &
+nc -d 127.0.0.1 "$PORT" >/dev/null &
 NCPID=$!
-sleep 0.5                                       # 서버가 이 연결을 처리하며 read에서 막힘
-blk=$(mask_of "$PID" SigBlk)
-has_bits "$blk" && ok "(b) 연결 처리 중엔 SIGINT/SIGTERM 막힘 (SigBlk=$blk)" || bad "(b) 처리 중 막힘" "SigBlk=$blk"
-kill -INT "$PID"
-sleep 0.2
-pnd=$(mask_of "$PID" ShdPnd)
-has_bits "$pnd" >/dev/null; [ $(( 0x$pnd & 0x2 )) -ne 0 ] && ok "(b) 처리 중 온 SIGINT는 보류됨 (ShdPnd=$pnd)" || bad "(b) SIGINT 보류" "ShdPnd=$pnd"
-kill -0 "$PID" 2>/dev/null && ok "(b) 보류 중엔 아직 살아 있음" || bad "(b) 보류 중 생존" "이미 종료"
+sleep 0.5                                       # 워커 하나가 이 연결을 처리하며 read에서 막힘
 t0=$(now_ms)
+kill -INT "$PID"
+sleep 0.3
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PORT/")
+expect_eq "(c) SIGINT 직후 새 연결은 받지 않음 (듣기 소켓 닫음)" "$code" "000"
+kill -0 "$PID" 2>/dev/null && ok "(c) 처리 중인 연결이 끝날 때까지는 살아 있음" || bad "(c) 처리 중 생존" "이미 종료"
 wait_exit 10; rc=$?
 elapsed=$(( $(now_ms) - t0 ))
 kill "$NCPID" 2>/dev/null
-expect_eq "(c) 보류된 SIGINT로 정상 종료" "$rc" "0"
-[ "$elapsed" -le 7000 ] && ok "(c) 연결 처리가 끝나자 바로 종료 (${elapsed}ms)" || bad "(c) 종료 지연" "${elapsed}ms"
+expect_eq "(c) 처리 중인 연결을 마치고 정상 종료" "$rc" "0"
+[ "$elapsed" -le 7000 ] && ok "(c) 유휴 타임아웃 안에 종료 (${elapsed}ms)" || bad "(c) 종료 지연" "${elapsed}ms"
+
+# ───────────── 10. 스레드 풀 포화 → 503 ─────────────
+echo "== 10. 스레드 풀 포화"
+start_server -t 1 -q 1
+nc -d 127.0.0.1 "$PORT" >/dev/null & B1=$!
+sleep 0.3                                       # 워커 1개가 이 연결에 묶임
+nc -d 127.0.0.1 "$PORT" >/dev/null & B2=$!
+sleep 0.3                                       # 큐 1칸도 참
+t0=$(now_ms)
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/")
+elapsed=$(( $(now_ms) - t0 ))
+expect_eq "워커·큐 모두 차면 503" "$code" "503"
+[ "$elapsed" -le 1000 ] && ok "기다리지 않고 바로 거절 (${elapsed}ms)" || bad "503 지연" "${elapsed}ms"
+kill "$B1" "$B2" 2>/dev/null
+expect_eq "포화가 풀리면 다시 200" "$(until_200 "http://127.0.0.1:$PORT/" 15)" "200"
+stop_server
+
+# 붐빌 때 keep-alive 양보: 워커 1개가 keep-alive 연결 A를 처리 중일 때 B가 큐에서 기다리면,
+# A에 응답한 뒤 연결을 끊고 워커를 B에게 넘겨야 한다 (안 그러면 B는 A의 유휴 타임아웃 5초를 기다림)
+start_server -t 1 -q 4
+{ sleep 0.6; printf 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'; sleep 10; } | nc 127.0.0.1 "$PORT" >/tmp/w13_conn_a 2>&1 & A=$!
+sleep 0.2                                       # A가 워커를 먼저 차지 (아직 요청 전)
+t0=$(now_ms)
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:$PORT/")   # B: 큐에서 대기
+elapsed=$(( $(now_ms) - t0 ))
+expect_eq "큐에서 기다린 요청도 처리됨" "$code" "200"
+[ "$elapsed" -le 2000 ] && ok "keep-alive 연결이 응답 후 워커를 양보 (${elapsed}ms)" || bad "워커 양보 안 함" "${elapsed}ms (A의 유휴 타임아웃까지 대기)"
+grep -q '^Connection: close' /tmp/w13_conn_a && ok "양보한 연결 A의 응답은 Connection: close" || bad "A 응답 헤더" "$(head -5 /tmp/w13_conn_a)"
+kill "$A" 2>/dev/null
+rm -f /tmp/w13_conn_a
+stop_server
+
+# ───────────── 11. fd 한도(EMFILE) ─────────────
+echo "== 11. fd 한도 (ulimit -n 64)"
+( ulimit -n 64; exec "$SERVER" -p "$PORT" ) >"$LOG" 2>&1 &
+PID=$!
+sleep 0.4
+HOLD=()
+for _ in $(seq 90); do nc -d 127.0.0.1 "$PORT" >/dev/null 2>&1 & HOLD+=($!); done   # fd 64개를 넘김
+sleep 1
+ticks() { awk '{ print $14 + $15 }' /proc/"$PID"/stat; }   # 사용자+커널 CPU 시간 (1/100초)
+c0=$(ticks); sleep 1; c1=$(ticks)
+kill -0 "$PID" 2>/dev/null && ok "fd 한도에 걸려도 서버 생존" || bad "EMFILE 생존" "종료됨"
+[ $((c1 - c0)) -le 30 ] && ok "헛돌지 않음 (1초 동안 CPU $((c1 - c0))/100초)" || bad "EMFILE 바쁜 대기" "CPU $((c1 - c0))/100초"
+kill "${HOLD[@]}" 2>/dev/null
+expect_eq "fd가 돌아오면 다시 200" "$(until_200 "http://127.0.0.1:$PORT/" 20)" "200"
+left=$(for p in "${HOLD[@]}"; do kill -0 "$p" 2>/dev/null && echo "$p"; done | wc -l)
+expect_eq "연결을 붙잡던 클라이언트 프로세스가 모두 정리됨" "$left" "0"
+stop_server
 
 echo
 echo "결과: 통과 $PASS, 실패 $FAIL"

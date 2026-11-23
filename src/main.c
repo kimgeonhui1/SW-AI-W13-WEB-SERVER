@@ -39,7 +39,7 @@ int main(int argc, char **argv) {
         .routes_path = NULL,
         .forward_enabled = 0,
         .threads = 8,
-        .queue_size = 64,
+        .queue_size = 1024,
     };
     long v;
 

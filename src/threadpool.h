@@ -11,6 +11,9 @@ threadpool *threadpool_create(int nthreads, int queue_size, task_fn fn);
 // 연결 fd를 큐에 넣기. 성공 0, 큐가 가득 차면 -1 (호출한 쪽이 503 응답 후 close)
 int threadpool_submit(threadpool *pool, int connfd);
 
+// 큐에서 기다리는(아직 워커가 꺼내지 않은) 작업 수. 워커가 "붐비면 keep-alive를 양보"할지 판단할 때 사용
+int threadpool_queued(threadpool *pool);
+
 // 종료: 새 작업을 막고, 워커가 큐의 남은 작업을 마치면 join 후 메모리 해제
 void threadpool_destroy(threadpool *pool);
 

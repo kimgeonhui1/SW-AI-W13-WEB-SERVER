@@ -3,13 +3,17 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "cgi.h"
@@ -20,10 +24,29 @@
 #include "rio.h"
 #include "router.h"
 #include "static_file.h"
+#include "threadpool.h"
+
+// 종료 플래그: 시그널 핸들러(메인 스레드)가 쓰고 워커 스레드들이 읽는다.
+// volatile sig_atomic_t는 "시그널 ↔ 같은 스레드"만 보장하고 스레드 사이에선 데이터 경쟁(정의되지 않은 동작)이므로
+// C11 atomic을 쓴다. lock-free여야 시그널 핸들러 안에서 써도 안전하다
+#if ATOMIC_INT_LOCK_FREE != 2
+#error "atomic_int must be lock-free to be used from a signal handler"
+#endif
+static atomic_int g_stop = 0;
 
 static const server_config *g_cfg;            // run_server가 설정, 워커들은 읽기만 함
 static route_table g_routes;                  // 시작 시 한 번 로드, 이후 읽기 + next 카운터(atomic)만 변경
-static volatile sig_atomic_t g_stop = 0;      // 시그널 핸들러에서 안전하게 쓸 수 있는 타입
+static threadpool *g_pool;                    // 워커가 "큐에 기다리는 연결이 있는지" 볼 때 사용 (단위 테스트에선 NULL)
+
+static int stopping(void) { return atomic_load(&g_stop); }
+
+// 큐가 가득 참 → 짧게 503을 알리고 닫는다 (메인 스레드에서 실행되므로 오래 막히면 안 됨: 송신 1초 제한)
+static void reject_busy(int connfd) {
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(connfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    send_error(connfd, 503, 0);
+    close(connfd);
+}
 
 static void set_nonblocking(int fd, int on) {
     int flags = fcntl(fd, F_GETFL);
@@ -56,8 +79,18 @@ int run_server(const server_config *cfg) {
     // accept가 다음 연결까지 막힐 수 있다 → 듣기 소켓만 non-blocking으로 두고 EAGAIN이면 다시 기다린다
     set_nonblocking(listenfd, 1);
 
-    // TODO(4단계): threadpool_create 후 아래 handle_connection 직접 호출을 threadpool_submit으로 교체
-    while (!g_stop) {
+    // 워커는 만들어지는 순간의 시그널 마스크를 물려받는다 → 위에서 막은 뒤에 만들어야
+    // SIGINT/SIGTERM이 워커가 아니라 pselect로 기다리는 메인 스레드에만 전달된다
+    threadpool *pool = threadpool_create(cfg->threads, cfg->queue_size, handle_connection);
+    g_pool = pool;
+    if (pool == NULL) {
+        fprintf(stderr, "threadpool_create failed\n");
+        close(listenfd);
+        pthread_sigmask(SIG_SETMASK, &orig_mask, NULL);
+        return -1;
+    }
+
+    while (!stopping()) {
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(listenfd, &rfds);
@@ -71,18 +104,27 @@ int run_server(const server_config *cfg) {
         int connfd = accept(listenfd, NULL, NULL);
         if (connfd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED || errno == EINTR) continue;
-            // EMFILE(fd 한도) 등: 서버 전체를 죽이지 않고 다음 연결을 기다린다
-            // shortcut: EMFILE이 계속되면 매번 바로 실패하며 루프가 빠르게 돈다. 4단계에서 잠깐 쉬는 처리 추가
-            perror("accept");
+            if (errno == EMFILE || errno == ENFILE) {
+                // fd 한도: 대기 연결은 큐에 남아 있어 pselect가 곧바로 또 "읽을 수 있음"을 알려 준다
+                // → 그대로 돌면 CPU 100%로 헛돈다. 워커가 연결을 닫아 fd가 생길 때까지 잠깐 쉰다
+                struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
+                nanosleep(&ts, NULL);
+                continue;
+            }
+            perror("accept");               // 그 밖의 오류도 서버 전체를 죽이지 않고 다음 연결을 기다린다
             continue;
         }
         set_cloexec(connfd);
         set_nonblocking(connfd, 0);         // macOS 등은 듣기 소켓의 O_NONBLOCK을 물려주므로 명시적으로 blocking
-        handle_connection(connfd);          // 1단계: 스레드 없이 연결을 하나씩 처리
+        if (threadpool_submit(pool, connfd) != 0) reject_busy(connfd);
     }
 
-    pthread_sigmask(SIG_SETMASK, &orig_mask, NULL);
+    // 종료: 새 연결부터 막고 → 워커가 처리 중인 연결과 큐에 남은 연결을 마치길 기다린다
+    // (워커의 keep-alive 루프는 stopping()을 보고 지금 요청까지만 응답한 뒤 Connection: close로 끝낸다)
     close(listenfd);
+    threadpool_destroy(pool);
+    g_pool = NULL;
+    pthread_sigmask(SIG_SETMASK, &orig_mask, NULL);
     printf("server stopped\n");
     return 0;
 }
@@ -144,10 +186,14 @@ void handle_connection(int connfd) {
     // 송신 타임아웃: 응답을 읽지 않는 클라이언트 때문에 큰 파일 전송(write)이 영원히 막히지 않게
     struct timeval wtv = { .tv_sec = SEND_TIMEOUT_SEC, .tv_usec = 0 };
     setsockopt(connfd, SOL_SOCKET, SO_SNDTIMEO, &wtv, sizeof(wtv));
+    // Nagle 끄기: 응답을 헤더 write + 본문 write로 나눠 보내므로, 켜져 있으면 상대의 지연 ACK와 겹쳐
+    // 요청마다 ~40ms씩 멈춘다 (실측: 동시 10연결에서 초당 173건). TCP가 아닌 소켓(테스트의 socketpair)에선 실패해도 무시
+    int one = 1;
+    setsockopt(connfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     http_request req;
     // keep-alive: 한 연결로 요청을 여러 번 받는다. 클라이언트가 닫거나·close를 원하거나·오류가 나거나·서버 종료 중이면 멈춤
-    while (!g_stop) {
+    while (!stopping()) {
         int rc = read_request(&rio, &req);
         if (rc < 0) break;                      // EOF, 유휴 시간 초과, 읽기 에러 → 응답 없이 종료
         if (rc > 0) {                           // 형식 오류 등: 남은 입력의 경계를 믿을 수 없으므로 알려 주고 닫는다
@@ -155,7 +201,12 @@ void handle_connection(int connfd) {
             break;
         }
 
-        int keep = req.keep_alive && !g_stop;   // 종료 중이면 이번 응답에 Connection: close
+        // 이번 응답 뒤에도 연결을 유지할지:
+        //  - 종료 중이면 끊는다
+        //  - 큐에서 기다리는 연결이 있으면 끊고 워커를 넘겨준다 (keep-alive 연결이 워커를 계속 붙잡으면
+        //    워커 수를 넘는 클라이언트는 큐에서 굶거나 503을 받는다. 한가할 땐 keep-alive 그대로 유지)
+        int busy = (g_pool != NULL && threadpool_queued(g_pool) > 0);
+        int keep = req.keep_alive && !stopping() && !busy;
         req.keep_alive = keep;
         int hr = dispatch(connfd, &req);
         if (hr > 0 && reply_error(connfd, hr, &req, keep) != 0) hr = -1;
@@ -167,5 +218,5 @@ void handle_connection(int connfd) {
 }
 
 void request_stop(void) {
-    g_stop = 1;
+    atomic_store(&g_stop, 1);                   // lock-free atomic이라 시그널 핸들러에서 호출해도 안전
 }
