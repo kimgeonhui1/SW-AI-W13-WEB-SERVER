@@ -1,0 +1,2 @@
+# Windows에서 clone해도 줄바꿈을 LF로 유지 (CRLF면 셸 스크립트가 WSL·Linux에서 깨짐)
+* text=auto eol=lf
