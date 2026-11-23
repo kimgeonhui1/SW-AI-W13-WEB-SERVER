@@ -20,10 +20,11 @@ ssize_t rio_writen(int fd, const void *buf, size_t n);
 // rp를 fd에 연결하고 내부 버퍼를 비운다
 void rio_readinitb(rio_t *rp, int fd);
 
-// '\n'까지 한 줄 읽기 (최대 maxlen-1바이트 + '\0'). 읽은 바이트 수, EOF면 0, 실패 -1
+// '\n'까지 한 줄 읽기 (최대 maxlen-1바이트 + '\0'). 읽은 바이트 수, EOF면 0, 실패·maxlen<=1이면 -1
 ssize_t rio_readlineb(rio_t *rp, void *buf, size_t maxlen);
 
 // 정확히 n바이트 읽기 (헤더 뒤 body용, rio_readlineb와 같은 버퍼를 이어서 사용). 읽은 바이트 수(EOF면 n보다 작음), 실패 -1
+// n == 0이면 아무것도 읽지 않고 0 — EOF와 구분하려면 호출 전에 n > 0인지 확인할 것
 ssize_t rio_readnb(rio_t *rp, void *buf, size_t n);
 
 #endif

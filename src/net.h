@@ -9,4 +9,7 @@ int open_listenfd(const char *port);
 // 실패해도 프로세스를 종료하지 않는다 — 호출한 쪽이 502로 응답해야 하므로
 int open_clientfd(const char *host, const char *port);
 
+// fd에 FD_CLOEXEC 설정 — CGI(fork + execve) 자식이 이 fd를 물려받지 않게 한다 (accept로 받은 fd에도 사용)
+void set_cloexec(int fd);
+
 #endif

@@ -1,20 +1,109 @@
 // [net.c] 소켓 연결 도우미 구현
 #include "net.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#define LISTEN_BACKLOG 1024   // handshake가 끝났지만 아직 accept되지 않은 연결을 커널이 쌓아 둘 개수
+
+void set_cloexec(int fd) {
+    // CGI가 fork + execve할 때 자식이 이 fd를 물려받지 않게 한다.
+    // 물려받으면 다른 클라이언트의 연결이 CGI 프로그램이 끝날 때까지 닫히지 않는다
+    int flags = fcntl(fd, F_GETFD);
+    if (flags >= 0) fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
+// 포트 문자열 검사: 숫자로만 된 0~65535.
+// getaddrinfo(AI_NUMERICSERV)는 "", "65536", " 80", "+80"도 에러 없이 받아 포트 0이나 잘린 값으로 바꿔 버리므로
+// (예: open_listenfd("")가 아무 포트에나 열림) 직접 확인한다. allow_zero: 0 = "커널이 빈 포트를 골라 달라"
+static int valid_port(const char *port, int allow_zero) {
+    if (port == NULL || *port == '\0') return 0;
+    long v = 0;
+    for (const char *p = port; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') return 0;
+        v = v * 10 + (*p - '0');
+        if (v > 65535) return 0;
+    }
+    return allow_zero || v != 0;
+}
+
 int open_listenfd(const char *port) {
-    (void)port;
-    // TODO:
-    //  1. hints: SOCK_STREAM, AI_PASSIVE | AI_ADDRCONFIG | AI_NUMERICSERV
-    //  2. getaddrinfo(NULL, port, ...) → 후보마다 socket → setsockopt(SO_REUSEADDR) → bind, 성공하면 멈춤
-    //  3. freeaddrinfo, listen(fd, 1024). listen 실패 시 close 후 -1
-    return -1;
+    struct addrinfo hints, *list, *p;
+    int fd = -1, optval = 1, last_errno = 0;
+
+    if (!valid_port(port, 1)) {
+        fprintf(stderr, "open_listenfd: invalid port '%s'\n", port ? port : "(null)");
+        return -1;
+    }
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;                                  // TCP
+    hints.ai_flags = AI_PASSIVE | AI_ADDRCONFIG | AI_NUMERICSERV;     // host=NULL → 와일드카드 주소(0.0.0.0 / ::)
+    int rc = getaddrinfo(NULL, port, &hints, &list);
+    if (rc != 0) {
+        fprintf(stderr, "open_listenfd: getaddrinfo(%s): %s\n", port, gai_strerror(rc));
+        return -1;
+    }
+
+    // 후보(IPv4, IPv6 ...)를 차례로 시도해 bind가 성공하는 첫 주소를 쓴다
+    for (p = list; p != NULL; p = p->ai_next) {
+        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (fd < 0) {
+            last_errno = errno;
+            continue;
+        }
+        set_cloexec(fd);                    // 만들자마자 설정 — 이후 어느 시점에 fork가 있어도 새지 않음
+        // 서버를 껐다 바로 켤 때 이전 연결이 TIME_WAIT로 남아 있어도 같은 포트에 bind 허용
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+        if (bind(fd, p->ai_addr, p->ai_addrlen) == 0) break;
+        last_errno = errno;
+        close(fd);                          // 실패한 소켓은 닫아야 fd 누수가 없다
+        fd = -1;
+    }
+    freeaddrinfo(list);
+
+    if (fd < 0) {
+        fprintf(stderr, "open_listenfd: bind port %s: %s\n", port, strerror(last_errno));
+        return -1;
+    }
+    if (listen(fd, LISTEN_BACKLOG) < 0) {   // 능동 소켓 → 듣기 소켓으로 전환
+        fprintf(stderr, "open_listenfd: listen: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
 }
 
 int open_clientfd(const char *host, const char *port) {
-    (void)host; (void)port;
-    // TODO:
-    //  1. hints: SOCK_STREAM, AI_ADDRCONFIG | AI_NUMERICSERV
-    //  2. getaddrinfo(host, port, ...) → 후보마다 socket → connect, 성공하면 멈춤 (실패한 소켓은 close)
-    //  3. freeaddrinfo
-    return -1;
+    struct addrinfo hints, *list, *p;
+    int fd = -1;
+
+    // host가 NULL이면 getaddrinfo가 루프백(localhost)을 돌려줘 엉뚱한 곳에 접속하므로 막는다. 포트 0도 접속 대상이 아님
+    if (host == NULL || *host == '\0' || !valid_port(port, 0)) return -1;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_ADDRCONFIG | AI_NUMERICSERV;
+    // 호스트 이름이면 여기서 DNS 조회가 일어난다
+    int rc = getaddrinfo(host, port, &hints, &list);
+    if (rc != 0) return -1;                 // DNS 실패 → 호출한 쪽(프록시)이 502로 처리
+
+    // shortcut: connect는 블로킹이라 응답 없는 호스트면 커널 기본 시간(수십 초)까지 기다린다.
+    //           Forward Proxy에서 외부 호스트 대기가 문제 되면 non-blocking connect + 타임아웃으로 교체
+    for (p = list; p != NULL; p = p->ai_next) {
+        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (fd < 0) continue;
+        set_cloexec(fd);
+        if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) break;
+        close(fd);                          // 이 후보는 실패 → 닫고 다음 후보
+        fd = -1;
+    }
+    freeaddrinfo(list);
+    return fd;
 }
