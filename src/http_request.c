@@ -1,46 +1,374 @@
 // [http_request.c] HTTP 요청 파서 구현
-// TCP는 메시지 경계가 없으므로 HTTP 규칙으로 경계를 찾는다: 헤더 끝 = 빈 줄("\r\n"), 본문 끝 = Content-Length
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "http_request.h"
 
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+static void strip_crlf(char *s) {
+    size_t len = strlen(s);
+    while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r')) {
+        s[--len] = '\0';
+    }
+}
+
+static int is_tchar(unsigned char c) {
+    if (isalnum(c)) return 1;
+    switch (c) {
+    case '!': case '#': case '$': case '%': case '&':
+    case '\'': case '*': case '+': case '-': case '.':
+    case '^': case '_': case '`': case '|': case '~':
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int is_valid_token(const char *s, size_t len) {
+    if (len == 0) return 0;
+    for (size_t i = 0; i < len; i++) {
+        if (!is_tchar((unsigned char)s[i])) return 0;
+    }
+    return 1;
+}
+
+static int is_valid_uri_char(unsigned char c) {
+    // 제어문자(0x00~0x1F, 0x7F) 및 공백 금지
+    return c > 0x20 && c != 0x7F;
+}
+
+static int has_valid_abs_http_host(const char *uri) {
+    if (strlen(uri) >= 7 && strncasecmp(uri, "http://", 7) == 0) {
+        const char *after = uri + 7;
+        // "http://", "http:///path", "http://?a=1" 등 빈 호스트 차단
+        if (*after == '\0' || *after == '/' || *after == '?') return 0;
+    }
+    return 1;
+}
+
+static void split_target_path_query(const char *uri,
+                                    char *path_out, size_t path_cap,
+                                    char *query_out, size_t query_cap) {
+    path_out[0] = '\0';
+    query_out[0] = '\0';
+
+    const char *target = uri;
+
+    // Forward Proxy absolute-form: "http://" (대소문자 무시)
+    if (strlen(uri) > 7 && strncasecmp(uri, "http://", 7) == 0) {
+        const char *after_scheme = uri + 7;
+        const char *slash = strchr(after_scheme, '/');
+        const char *q = strchr(after_scheme, '?');
+        if (slash != NULL && (q == NULL || slash < q)) {
+            target = slash;
+        } else {
+            // "http://example.com" 또는 "http://example.com?a=1" 형태
+            snprintf(path_out, path_cap, "/");
+            if (q != NULL) {
+                snprintf(query_out, query_cap, "%s", q + 1);
+            }
+            return;
+        }
+    }
+
+    const char *q = strchr(target, '?');
+    if (q != NULL) {
+        size_t plen = (size_t)(q - target);
+        if (plen >= path_cap) plen = path_cap - 1;
+        memcpy(path_out, target, plen);
+        path_out[plen] = '\0';
+        snprintf(query_out, query_cap, "%s", q + 1);
+    } else {
+        snprintf(path_out, path_cap, "%s", target);
+    }
+}
+
+static int check_http_version(const char *ver, char *out, size_t out_cap) {
+    if (strcmp(ver, "HTTP/1.1") == 0 || strcmp(ver, "HTTP/1.0") == 0) {
+        snprintf(out, out_cap, "%s", ver);
+        return 0;
+    }
+    // HTTP/<major>.<minor> 형태면 지원하지 않는 버전 -> 505
+    if (strncmp(ver, "HTTP/", 5) == 0) {
+        const char *p = ver + 5;
+        int maj_digits = 0, min_digits = 0;
+        while (*p && isdigit((unsigned char)*p)) { maj_digits++; p++; }
+        if (*p == '.') {
+            p++;
+            while (*p && isdigit((unsigned char)*p)) { min_digits++; p++; }
+            if (*p == '\0' && maj_digits > 0 && min_digits > 0) {
+                return 505;
+            }
+        }
+    }
+    return 400;
+}
+
 int parse_request_line(const char *line, http_request *req) {
-    (void)line; (void)req;
-    // TODO:
-    //  - "메서드 URI 버전" 3개로 나눔. 개수가 다르면 400
-    //  - 메서드가 GET/POST/HEAD가 아니면 501
-    //  - URI가 MAX_URI_LEN 이상이면 414
-    //  - 버전이 HTTP/1.0, HTTP/1.1이 아니면 505
-    //  - URI를 '?' 기준으로 path / query로 분리 (절대 URI "http://host/..."면 호스트 뒤 부분 기준)
-    //  - keep_alive 기본값: HTTP/1.1이면 1, HTTP/1.0이면 0
-    return -1;
+    if (line == NULL || req == NULL) return 400;
+
+    char buf[MAX_LINE];
+    size_t raw_len = strlen(line);
+    if (raw_len == 0 || raw_len >= sizeof(buf)) return 400;
+    memcpy(buf, line, raw_len + 1);
+    strip_crlf(buf);
+    if (buf[0] == '\0') return 400;
+
+    // 공백(' ') 기준으로 정확히 3개 파트 분리 (연속 공백/선후행 공백 불허)
+    char *sp1 = strchr(buf, ' ');
+    if (sp1 == NULL || sp1 == buf) return 400;
+    *sp1 = '\0';
+
+    char *uri_start = sp1 + 1;
+    if (*uri_start == ' ' || *uri_start == '\0') return 400;
+
+    char *sp2 = strchr(uri_start, ' ');
+    if (sp2 == NULL || sp2 == uri_start) return 400;
+    *sp2 = '\0';
+
+    char *ver_start = sp2 + 1;
+    if (*ver_start == '\0' || strchr(ver_start, ' ') != NULL) return 400;
+
+    size_t method_len = strlen(buf);
+    if (!is_valid_token(buf, method_len)) return 400;
+    if (method_len >= sizeof(req->method)) return 501;
+    if (strcmp(buf, "GET") != 0 && strcmp(buf, "POST") != 0 && strcmp(buf, "HEAD") != 0) {
+        return 501;
+    }
+
+    size_t uri_len = strlen(uri_start);
+    if (uri_len >= MAX_URI_LEN) return 414;
+    for (size_t i = 0; i < uri_len; i++) {
+        if (!is_valid_uri_char((unsigned char)uri_start[i])) return 400;
+    }
+    if (!has_valid_abs_http_host(uri_start)) return 400;
+
+    int ver_status = check_http_version(ver_start, req->version, sizeof(req->version));
+    if (ver_status != 0) return ver_status;
+
+    memcpy(req->method, buf, method_len);
+    req->method[method_len] = '\0';
+
+    snprintf(req->uri, sizeof(req->uri), "%s", uri_start);
+    split_target_path_query(req->uri,
+                            req->path, sizeof(req->path),
+                            req->query, sizeof(req->query));
+
+    req->keep_alive = (strcmp(req->version, "HTTP/1.1") == 0) ? 1 : 0;
+    return 0;
+}
+
+static int parse_content_length_val(const char *val, size_t *out_len) {
+    if (val == NULL || *val == '\0') return 400;
+    for (const char *p = val; *p != '\0'; p++) {
+        if (!isdigit((unsigned char)*p)) return 400;
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(val, &end, 10);
+    if (errno == ERANGE || end == val || *end != '\0') return 400;
+    if (parsed > (unsigned long long)MAX_BODY_LEN) return 413;
+    *out_len = (size_t)parsed;
+    return 0;
+}
+
+static void apply_connection_header(http_request *req, const char *val) {
+    // 콤마로 구분된 토큰 중 close / keep-alive 확인
+    char tmp[MAX_HEADER_VALUE];
+    snprintf(tmp, sizeof(tmp), "%s", val);
+
+    char *tok = tmp;
+    while (tok != NULL && *tok != '\0') {
+        char *comma = strchr(tok, ',');
+        if (comma != NULL) *comma = '\0';
+
+        while (*tok == ' ' || *tok == '\t') tok++;
+        char *end = tok + strlen(tok);
+        while (end > tok && (end[-1] == ' ' || end[-1] == '\t')) end--;
+        *end = '\0';
+
+        if (strcasecmp(tok, "close") == 0) {
+            req->keep_alive = 0;
+        } else if (strcasecmp(tok, "keep-alive") == 0) {
+            req->keep_alive = 1;
+        }
+
+        tok = (comma != NULL) ? (comma + 1) : NULL;
+    }
 }
 
 int parse_header_line(const char *line, http_request *req) {
-    (void)line; (void)req;
-    // TODO:
-    //  - ':'가 없으면 400
-    //  - 헤더 개수가 MAX_HEADERS를 넘거나 이름·값이 너무 길면 431
-    //  - Content-Length: 숫자가 아니면 400, MAX_BODY_LEN 초과면 413
-    //  - Connection: close / keep-alive → keep_alive 갱신
-    return -1;
+    if (line == NULL || req == NULL) return 400;
+
+    char buf[MAX_LINE];
+    size_t raw_len = strlen(line);
+    if (raw_len == 0 || raw_len >= sizeof(buf)) return 431;
+    memcpy(buf, line, raw_len + 1);
+    strip_crlf(buf);
+    if (buf[0] == '\0') return 0;
+
+    // obs-fold(공백/탭으로 시작하는 줄) 또는 ':' 앞 공백은 불허
+    if (buf[0] == ' ' || buf[0] == '\t') return 400;
+
+    char *colon = strchr(buf, ':');
+    if (colon == NULL) return 400;
+    *colon = '\0';
+
+    size_t name_len = strlen(buf);
+    if (!is_valid_token(buf, name_len)) return 400;
+    if (name_len >= MAX_HEADER_NAME) return 431;
+
+    if (req->header_count >= MAX_HEADERS) return 431;
+
+    const char *vstart = colon + 1;
+    while (*vstart == ' ' || *vstart == '\t') vstart++;
+
+    size_t vlen = strlen(vstart);
+    while (vlen > 0 && (vstart[vlen - 1] == ' ' || vstart[vlen - 1] == '\t')) {
+        vlen--;
+    }
+    if (vlen >= MAX_HEADER_VALUE) return 431;
+
+    const char *prev_cl = get_header(req, "Content-Length");
+
+    size_t parsed_cl = 0;
+    int is_cl = (strcasecmp(buf, "Content-Length") == 0);
+    if (is_cl) {
+        if (prev_cl != NULL) return 400;
+        // h->value에 들어갈 공백 제거 문자열 기준으로 검증
+        char val_tmp[MAX_HEADER_VALUE];
+        memcpy(val_tmp, vstart, vlen);
+        val_tmp[vlen] = '\0';
+        int rc = parse_content_length_val(val_tmp, &parsed_cl);
+        if (rc != 0) return rc;
+    }
+
+    http_header *h = &req->headers[req->header_count];
+    memcpy(h->name, buf, name_len);
+    h->name[name_len] = '\0';
+    memcpy(h->value, vstart, vlen);
+    h->value[vlen] = '\0';
+    req->header_count++;
+
+    if (is_cl) {
+        req->content_length = parsed_cl;
+    } else if (strcasecmp(h->name, "Connection") == 0) {
+        apply_connection_header(req, h->value);
+    }
+
+    return 0;
 }
 
 int read_request(rio_t *rp, http_request *req) {
-    (void)rp; (void)req;
-    // TODO:
-    //  1. rio_readlineb로 요청 라인 → parse_request_line (0바이트면 EOF → -1)
-    //  2. "\r\n"만 있는 줄이 나올 때까지 parse_header_line
-    //  3. HTTP/1.1인데 Host 헤더가 없으면 400
-    //  4. POST인데 Content-Length가 없으면 411, Transfer-Encoding: chunked면 501 (chunked 미지원)
-    //  5. content_length > 0 이면 malloc 후 rio_readnb로 정확히 그만큼 읽기
-    return -1;
+    if (rp == NULL || req == NULL) return -1;
+
+    memset(req, 0, sizeof(*req));
+
+    char line[MAX_LINE];
+    ssize_t n = rio_readlineb(rp, line, sizeof(line));
+    if (n < 0) return -1;
+    if (n == 0) return -1; // 정상 EOF(요청 시작 전 연결 종료)
+    // 요청 라인이 버퍼보다 길어 잘림('\n' 없이 가득 참) → 잘린 줄은 버전이 빠져 400으로 오판되므로 414로 거부
+    if (line[n - 1] != '\n' && (size_t)n == sizeof(line) - 1) return 414;
+
+    int rc = parse_request_line(line, req);
+    if (rc != 0) {
+        free_request(req);
+        return rc;
+    }
+
+    while (1) {
+        n = rio_readlineb(rp, line, sizeof(line));
+        if (n < 0) {
+            free_request(req);
+            return -1;
+        }
+        if (n == 0) {
+            free_request(req);
+            return 400;
+        }
+        if (strcmp(line, "\r\n") == 0 || strcmp(line, "\n") == 0) {
+            break;
+        }
+        if (line[n - 1] != '\n' && (size_t)n == sizeof(line) - 1) {
+            free_request(req);
+            return 431;
+        }
+
+        rc = parse_header_line(line, req);
+        if (rc != 0) {
+            free_request(req);
+            return rc;
+        }
+    }
+
+    if (strcmp(req->version, "HTTP/1.1") == 0 && get_header(req, "Host") == NULL) {
+        free_request(req);
+        return 400;
+    }
+
+    // Transfer-Encoding은 종류(chunked, gzip ...)와 상관없이 지원하지 않는다.
+    // chunked만 막고 나머지를 통과시키면 Content-Length와 함께 왔을 때 본문 경계를
+    // 프록시·백엔드가 서로 다르게 해석할 수 있다(request smuggling) → 헤더가 있으면 전부 501
+    if (get_header(req, "Transfer-Encoding") != NULL) {
+        free_request(req);
+        return 501;
+    }
+
+    if (strcmp(req->method, "POST") == 0 && get_header(req, "Content-Length") == NULL) {
+        free_request(req);
+        return 411;
+    }
+
+    // content_length == 0인 경우 별도 할당 없이 req->body == NULL 상태 유지
+    if (req->content_length > 0) {
+        if (req->content_length > MAX_BODY_LEN) {
+            free_request(req);
+            return 413;
+        }
+        req->body = malloc(req->content_length + 1);
+        if (req->body == NULL) {
+            free_request(req);
+            return 500;
+        }
+
+        ssize_t got = rio_readnb(rp, req->body, req->content_length);
+        if (got < 0) {
+            free_request(req);
+            return -1;
+        }
+        if ((size_t)got < req->content_length) {
+            free_request(req);
+            return 400;
+        }
+        req->body[req->content_length] = '\0';
+    }
+
+    return 0;
 }
 
 const char *get_header(const http_request *req, const char *name) {
-    (void)req; (void)name;
-    return NULL; // TODO: headers를 돌며 strcasecmp로 이름 비교
+    if (req == NULL || name == NULL) return NULL;
+    for (int i = 0; i < req->header_count; i++) {
+        if (strcasecmp(req->headers[i].name, name) == 0) {
+            return req->headers[i].value;
+        }
+    }
+    return NULL;
 }
 
 void free_request(http_request *req) {
-    (void)req;
-    // TODO: free(req->body), body = NULL
+    if (req == NULL) return;
+    free(req->body);
+    req->body = NULL;
+    req->content_length = 0;
+    req->header_count = 0;
 }

@@ -2,7 +2,8 @@
 #ifndef MIME_H
 #define MIME_H
 
-// 경로의 확장자 → MIME 타입 (".html" → "text/html"). 모르는 확장자·확장자 없음 → "application/octet-stream"
-const char *mime_type(const char *path);
+// URI/경로 또는 파일명에서 Content-Type MIME 문자열을 반환한다.
+// 쿼리스트링('?')은 무시하며, 알 수 없는 확장자는 "application/octet-stream"을 반환한다.
+const char *mime_type_from_path(const char *path);
 
 #endif
