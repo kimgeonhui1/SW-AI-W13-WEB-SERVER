@@ -177,6 +177,33 @@ static void test_read_request_post_and_errors(void) {
     CHECK(read_request(&rp, &req) == -1);
     close(sv[1]);
 
+    // HTTP/1.1에서 Host 헤더가 둘 이상 -> 400 (RFC 7230 5.4). 대소문자만 다른 경우도 같은 헤더
+    feed_and_close("GET / HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\n\r\n", &rp, sv);
+    CHECK(read_request(&rp, &req) == 400);
+    close(sv[1]);
+    feed_and_close("GET / HTTP/1.1\r\nHost: a.example\r\nhOsT: a.example\r\n\r\n", &rp, sv);
+    CHECK(read_request(&rp, &req) == 400);
+    close(sv[1]);
+    feed_and_close("GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n", &rp, sv);   // 1.0도 중복은 모호하므로 거부
+    CHECK(read_request(&rp, &req) == 400);
+    close(sv[1]);
+
+    // Content-Length가 MAX_BODY_LEN 초과 -> 413 (본문을 읽기 전에 거부, 메모리 할당 없음)
+    char big_cl[128];
+    snprintf(big_cl, sizeof(big_cl), "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n", MAX_BODY_LEN + 1);
+    feed_and_close(big_cl, &rp, sv);
+    CHECK(read_request(&rp, &req) == 413);
+    close(sv[1]);
+    // 정확히 MAX_BODY_LEN은 허용 범위 → 본문이 모자라 EOF이므로 400 (413이 아님)
+    snprintf(big_cl, sizeof(big_cl), "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\nab", MAX_BODY_LEN);
+    feed_and_close(big_cl, &rp, sv);
+    CHECK(read_request(&rp, &req) == 400);
+    close(sv[1]);
+    // unsigned long long도 넘는 값 -> 400 (오버플로를 413으로 오인하지 않음)
+    feed_and_close("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999999999999999999\r\n\r\n", &rp, sv);
+    CHECK(read_request(&rp, &req) == 400);
+    close(sv[1]);
+
     // Transfer-Encoding은 chunked가 아니어도(gzip 등) 지원하지 않음 -> 501 (Content-Length와 섞인 경계 해석 방지)
     feed_and_close("POST /submit HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\nContent-Length: 2\r\n\r\nhi", &rp, sv);
     CHECK(read_request(&rp, &req) == 501);

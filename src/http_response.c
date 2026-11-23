@@ -37,6 +37,8 @@ int send_headers(int fd, int status, const char *content_type, size_t content_le
     const char *ctype = (content_type != NULL && content_type[0] != '\0')
                             ? content_type
                             : "application/octet-stream";
+    // CR/LF가 섞이면 헤더 줄이 쪼개져 임의 헤더가 주입된다 (나중에 CGI·프록시가 값을 넘길 때 대비)
+    if (strpbrk(ctype, "\r\n") != NULL) return -1;
     const char *conn_val = keep_alive ? "keep-alive" : "close";
 
     char header_buf[2048];

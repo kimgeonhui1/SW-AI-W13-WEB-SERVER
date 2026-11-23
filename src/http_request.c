@@ -237,6 +237,9 @@ int parse_header_line(const char *line, http_request *req) {
     }
     if (vlen >= MAX_HEADER_VALUE) return 431;
 
+    // Host가 둘 이상이면 어느 호스트로 보낸 요청인지 모호 → 400 (RFC 7230 5.4). Content-Length 중복도 아래에서 400
+    if (strcasecmp(buf, "Host") == 0 && get_header(req, "Host") != NULL) return 400;
+
     const char *prev_cl = get_header(req, "Content-Length");
 
     size_t parsed_cl = 0;

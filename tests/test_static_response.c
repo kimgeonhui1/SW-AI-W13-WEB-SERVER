@@ -9,6 +9,7 @@
 #include "static_file.h"
 #include "test.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -94,6 +95,100 @@ static void test_response_helpers(void) {
     CHECK(strstr(buf, "\r\n\r\nhello") != NULL);
 }
 
+// Content-Type에 CR/LF가 섞이면 헤더가 쪼개져 임의 헤더가 주입될 수 있으므로 거부하고 아무것도 보내지 않음
+static void test_header_injection_rejected(void) {
+    const char *bad[] = { "text/plain\r\nSet-Cookie: x=1", "text/plain\nX: y", "text/plain\r" };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        CHECK(send_headers(sv[0], 200, bad[i], 0, 0) == -1);
+        CHECK(send_response(sv[0], 200, bad[i], "x", 1, 0) == -1);
+        close(sv[0]);
+        char buf[16];
+        CHECK(read(sv[1], buf, sizeof(buf)) == 0);
+        close(sv[1]);
+    }
+}
+
+// serve_static 결과를 다른 스레드에서 끝까지 읽기 (응답이 소켓 버퍼보다 커도 막히지 않게)
+struct collect_arg { int fd; char *buf; size_t cap; size_t len; };
+static void *collect_all(void *p) {
+    struct collect_arg *a = p;
+    for (;;) {
+        ssize_t r = read(a->fd, a->buf + a->len, a->cap - a->len);
+        if (r <= 0) break;
+        a->len += (size_t)r;
+        if (a->len == a->cap) break;
+    }
+    return NULL;
+}
+
+// GET 결과를 받아 헤더/본문으로 나눔. 본문 시작 위치를 반환 (없으면 NULL)
+static char *get_and_collect(const char *root, const char *path, char *buf, size_t cap, size_t *len, int *rc) {
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    struct collect_arg a = { .fd = sv[1], .buf = buf, .cap = cap, .len = 0 };
+    pthread_t t;
+    if (pthread_create(&t, NULL, collect_all, &a) != 0) {
+        CHECK(!"pthread_create failed");
+        close(sv[0]);
+        close(sv[1]);
+        *len = 0;
+        return NULL;
+    }
+    http_request req = { 0 };
+    snprintf(req.method, sizeof(req.method), "GET");
+    snprintf(req.path, sizeof(req.path), "%s", path);
+    *rc = serve_static(sv[0], root, &req);
+    close(sv[0]);                                           // EOF → 수집 스레드 종료
+    CHECK(pthread_join(t, NULL) == 0);
+    close(sv[1]);
+    *len = a.len;
+    char *sep = memmem(buf, a.len, "\r\n\r\n", 4);
+    return sep ? sep + 4 : NULL;
+}
+
+// 0바이트 파일: Content-Length: 0, 본문 없음 (file_size == 0 경로)
+// 64KB(STATIC_BUF_SIZE)를 넘는 파일: 여러 번 나눠 읽고 써도 바이트 단위로 원본과 같음
+static void test_file_sizes(void) {
+    char base[256], root[300], path[512];
+    setup_fixture(base, sizeof(base), root, sizeof(root));
+
+    snprintf(path, sizeof(path), "%s/empty.txt", root);
+    write_file(path, "");
+
+    enum { LARGE = 65536 * 3 + 123 };                       // 버퍼 크기의 정확한 배수가 아니게
+    static char large[LARGE];
+    for (size_t i = 0; i < LARGE; i++) large[i] = (char)((i * 7 + i / 251) & 0xff);
+    snprintf(path, sizeof(path), "%s/large.bin", root);
+    FILE *fp = fopen(path, "wb");
+    CHECK(fp != NULL);
+    if (fp) {
+        CHECK(fwrite(large, 1, LARGE, fp) == LARGE);
+        fclose(fp);
+    }
+
+    static char resp[LARGE + 1024];
+    size_t len;
+    int rc;
+
+    char *body = get_and_collect(root, "/empty.txt", resp, sizeof(resp), &len, &rc);
+    CHECK(rc == 0);
+    CHECK(memmem(resp, len, "Content-Length: 0\r\n", 19) != NULL);
+    CHECK(body != NULL && (size_t)(resp + len - body) == 0);
+
+    body = get_and_collect(root, "/large.bin", resp, sizeof(resp), &len, &rc);
+    CHECK(rc == 0);
+    char cl[64];
+    snprintf(cl, sizeof(cl), "Content-Length: %d\r\n", LARGE);
+    CHECK(memmem(resp, len, cl, strlen(cl)) != NULL);
+    CHECK(memmem(resp, len, "Content-Type: application/octet-stream\r\n", 40) != NULL);
+    CHECK(body != NULL && (size_t)(resp + len - body) == LARGE);
+    CHECK(body != NULL && memcmp(body, large, LARGE) == 0);
+
+    cleanup_fixture(base);
+}
+
 static void test_serve_static_cases(void) {
     char base[256], root[300];
     setup_fixture(base, sizeof(base), root, sizeof(root));
@@ -175,6 +270,8 @@ static void test_serve_static_cases(void) {
 
 int main(void) {
     test_response_helpers();
+    test_header_injection_rejected();
+    test_file_sizes();
     test_serve_static_cases();
     return TEST_RESULT();
 }
