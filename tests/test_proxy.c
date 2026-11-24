@@ -2,6 +2,7 @@
 // 가짜 백엔드: 스레드가 듣기 소켓에서 연결을 받아 요청을 기록하고, 정해 둔 응답 바이트를 그대로 보낸다
 // 클라이언트 쪽은 socketpair. 큰 응답에도 막히지 않도록 읽기 스레드가 동시에 비운다
 #include "test.h"
+#include "forward_proxy.h"
 #include "http_request.h"
 #include "net.h"
 #include "proxy.h"
@@ -161,7 +162,7 @@ static int relay_via(fake_backend *fb, route *r) {
         rc = reverse_proxy_request(sv[1], &g_req, r);
     } else {
         int up = open_clientfd("127.0.0.1", fb->port);
-        rc = proxy_relay(sv[1], up, &g_req, g_req.uri);
+        rc = proxy_relay(sv[1], up, &g_req, g_req.uri, NULL);
         close(up);
     }
     close(sv[1]);
@@ -410,6 +411,97 @@ static void test_reverse_round_robin_failover(void) {
     CHECK(g_resp_len == 0);
 }
 
+// ───────────── Forward Proxy ─────────────
+static int forward_once(void) {
+    int sv[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    pthread_t t;
+    pthread_create(&t, NULL, reader_main, &sv[0]);
+    int rc = forward_proxy_request(sv[1], &g_req);
+    close(sv[1]);
+    pthread_join(t, NULL);
+    close(sv[0]);
+    return rc;
+}
+
+// 절대 URI → 원 서버에는 경로만, Host는 URI의 authority로, 프록시용 헤더는 빼고
+static void test_forward_rewrite(void) {
+    fake_backend *fb = fake_start(RESP("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"), 0, 1);
+    char uri[128];
+    snprintf(uri, sizeof(uri), "http://127.0.0.1:%s/a.html?x=1#frag", fb->port);
+    make_req("GET", uri, 1);
+    add_header("Host", "spoofed.example");
+    add_header("Proxy-Connection", "keep-alive");
+    add_header("Proxy-Authorization", "Basic c2VjcmV0");
+    add_header("User-Agent", "t");
+    CHECK(forward_once() == 0);
+    CHECK(strncmp(fb->got, "GET /a.html?x=1 HTTP/1.1\r\n", 26) == 0);    // origin-form, 조각 없음
+    char host[64];
+    snprintf(host, sizeof(host), "\r\nHost: 127.0.0.1:%s\r\n", fb->port);
+    CHECK(strstr(fb->got, host) != NULL);
+    CHECK(strstr(fb->got, "spoofed") == NULL);
+    CHECK(strstr(fb->got, "Proxy-") == NULL);                            // 프록시 인증 정보가 원 서버로 새지 않음
+    CHECK(strstr(fb->got, "\r\nUser-Agent: t\r\n") != NULL);
+    CHECK(strstr(g_resp, "\r\nConnection: keep-alive\r\n") != NULL);
+    CHECK_STR(body_of(), "ok");
+    fake_stop(fb);
+
+    // 클라이언트가 Host를 안 보내도(HTTP/1.0) URI의 호스트로 채움
+    fb = fake_start(RESP("HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok"), 0, 1);
+    snprintf(uri, sizeof(uri), "http://127.0.0.1:%s", fb->port);
+    make_req("GET", uri, 0);
+    snprintf(g_req.version, sizeof(g_req.version), "HTTP/1.0");
+    CHECK(forward_once() == -1);
+    CHECK(strncmp(fb->got, "GET / HTTP/1.0\r\n", 16) == 0);
+    snprintf(host, sizeof(host), "\r\nHost: 127.0.0.1:%s\r\n", fb->port);
+    CHECK(strstr(fb->got, host) != NULL);
+    fake_stop(fb);
+}
+
+static void test_forward_errors(void) {
+    make_req("GET", "http://user@127.0.0.1:1/", 1);
+    CHECK(forward_once() == 400);                                       // URI 형식 오류
+    make_req("GET", "http://127.0.0.1:99999/", 1);
+    CHECK(forward_once() == 400);
+    char dead[8], uri[64];
+    dead_port(dead, sizeof(dead));
+    snprintf(uri, sizeof(uri), "http://127.0.0.1:%s/", dead);
+    make_req("GET", uri, 1);
+    CHECK(forward_once() == 502);                                       // 연결 거부
+    make_req("GET", "http://no-such-host.invalid/", 1);
+    CHECK(forward_once() == 502);                                       // DNS 실패 (.invalid는 존재하지 않는 도메인으로 예약됨)
+    CHECK(g_resp_len == 0);
+}
+
+// 연결을 받지 않는 호스트(SYN을 버림) → CONNECT_TIMEOUT_SEC 뒤 504
+// 듣기 큐를 꽉 채우면 Linux는 새 SYN에 응답하지 않으므로 패킷을 버리는 호스트처럼 동작한다
+static void test_forward_connect_timeout(void) {
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK), .sin_port = 0 };
+    bind(lfd, (struct sockaddr *)&a, sizeof(a));
+    listen(lfd, 0);
+    socklen_t sl = sizeof(a);
+    getsockname(lfd, (struct sockaddr *)&a, &sl);
+    int fill[8], nfill = 0;
+    for (int i = 0; i < 8; i++) {                                       // 큐를 채움 (accept하지 않음)
+        fill[nfill] = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        connect(fill[nfill], (struct sockaddr *)&a, sizeof(a));
+        nfill++;
+    }
+    sleep_ms(200);
+    char uri[64];
+    snprintf(uri, sizeof(uri), "http://127.0.0.1:%d/", ntohs(a.sin_port));
+    make_req("GET", uri, 1);
+    double t0 = rio_now();
+    int rc = forward_once();
+    double el = rio_now() - t0;
+    CHECK(rc == 504);
+    if (rc != 504 || el > CONNECT_TIMEOUT_SEC + 1.5) fprintf(stderr, "  connect timeout: rc=%d %.2fs\n", rc, el);
+    CHECK(el >= CONNECT_TIMEOUT_SEC - 0.2 && el < CONNECT_TIMEOUT_SEC + 1.5);
+    for (int i = 0; i < nfill; i++) close(fill[i]);
+    close(lfd);
+}
+
 static int count_fds(void) {
     DIR *d = opendir("/proc/self/fd");
     int n = 0;
@@ -434,6 +526,9 @@ int main(void) {
     test_reverse_round_robin_failover();
     test_timeout();
     test_header_drip();
+    test_forward_rewrite();
+    test_forward_errors();
+    test_forward_connect_timeout();
     CHECK(count_fds() == fds);                                        // 백엔드 소켓이 남지 않음
     free(g_req.body);
     free(g_resp);

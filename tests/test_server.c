@@ -1,5 +1,5 @@
 // [test_server.c] handle_connection 단위 테스트 — socketpair 한쪽을 "클라이언트", 다른 쪽을 connfd로 넘겨 검증
-// 요청 읽기 → 분기(정적 파일 / CGI / Forward 미구현 501 / Forward 비활성 403) → 응답, keep-alive 반복, 시간 제한, 연결 정리
+// 요청 읽기 → 분기(정적 파일 / CGI / Forward / Forward 비활성 403) → 응답, keep-alive 반복, 시간 제한, 연결 정리
 #include "test.h"
 #include "http_request.h"
 #include "server.h"
@@ -180,12 +180,13 @@ static void test_error_codes(void) {
     CHECK(strncmp(resp, "HTTP/1.1 403", 12) == 0);                                   // -f 없이 Forward 요청
 }
 
-static void test_forward_enabled_not_yet(void) {
+static void test_forward_enabled(void) {
     teardown();
     setup(1);
     char resp[2048];
-    exchange("GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n", resp, sizeof(resp));
-    CHECK(strncmp(resp, "HTTP/1.1 501", 12) == 0);                                   // Forward는 7단계
+    // -f면 원 서버로 연결 시도 (포트 1은 닫혀 있어 연결 거부 → 502). 외부 네트워크에 의존하지 않도록 루프백
+    exchange("GET http://127.0.0.1:1/ HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n", resp, sizeof(resp));
+    CHECK(strncmp(resp, "HTTP/1.1 502", 12) == 0);
     teardown();
     setup(0);
 }
@@ -374,7 +375,7 @@ int main(void) {
     test_head();
     test_bad_request_closes();
     test_error_codes();
-    test_forward_enabled_not_yet();
+    test_forward_enabled();
     test_body_too_large_still_gets_413();
     test_closes_connfd();
     test_client_gone_before_response();

@@ -5,8 +5,11 @@
 // 서버용 듣기 소켓: AI_PASSIVE로 0.0.0.0:port 주소를 받아 socket → SO_REUSEADDR → bind → listen. 성공 fd, 실패 -1
 int open_listenfd(const char *port);
 
+#define CONNECT_TIMEOUT_SEC 5   // 연결 수립(3-way handshake)을 기다리는 최대 시간
+
 // host:port 에 연결된 클라이언트 소켓 (프록시 → 백엔드용). 성공 fd, 실패 -1
 // 실패해도 프로세스를 종료하지 않는다 — 호출한 쪽이 502로 응답해야 하므로
+// 실패 시 errno: CONNECT_TIMEOUT_SEC 안에 연결이 안 되면 ETIMEDOUT, 거부되면 ECONNREFUSED 등
 int open_clientfd(const char *host, const char *port);
 
 // fd에 FD_CLOEXEC 설정 — CGI(fork + execve) 자식이 이 fd를 물려받지 않게 한다 (accept로 받은 fd에도 사용)

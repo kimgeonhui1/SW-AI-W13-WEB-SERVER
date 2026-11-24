@@ -382,6 +382,32 @@ timeout 3 "$SERVER" -p "$PORT" -c "$RP/none.conf" >/dev/null 2>&1
 expect_eq "없는 routes.conf → exit 1" "$?" "1"
 rm -rf "$RP"
 
+# ───────────── 14. Forward Proxy ─────────────
+echo "== 14. Forward Proxy (-f)"
+FP=$(mktemp -d)
+O=$((PORT + 21))
+mkdir -p "$FP/www"; printf 'origin' > "$FP/www/o.txt"
+"$SERVER" -p $O -r "$FP/www" >/dev/null 2>&1 & OP=$!
+until_200 "http://127.0.0.1:$O/o.txt" 5 >/dev/null
+start_server -f
+PX="127.0.0.1:$PORT"
+expect_eq "curl -x 로 원 서버 파일 받기" "$(curl -s -x "$PX" "http://127.0.0.1:$O/o.txt")" "origin"
+expect_eq "원 서버의 404 전달" "$(curl -s -o /dev/null -w '%{http_code}' -x "$PX" "http://127.0.0.1:$O/nope")" "404"
+expect_eq "쿼리 포함 URI" "$(curl -s -x "$PX" "http://127.0.0.1:$O/o.txt?v=1")" "origin"
+conns=$(curl -s -o /dev/null -o /dev/null -w '%{num_connects} ' -x "$PX" "http://127.0.0.1:$O/o.txt" "http://127.0.0.1:$O/o.txt")
+expect_eq "프록시 연결 keep-alive 유지 (새 연결 수)" "$conns" "1 0 "
+raw=$(printf 'GET HTTP://127.0.0.1:%s/o.txt HTTP/1.1\r\nHost: wrong.example\r\nConnection: close\r\n\r\n' $O | nc -q 2 127.0.0.1 "$PORT" | tail -c 6)
+expect_eq "스킴 대소문자 무시 + Host가 달라도 URI 기준" "$raw" "origin"
+# curl은 userinfo를 URI에서 빼서 보내므로 nc로 직접
+st=$(printf 'GET http://a@127.0.0.1:%s/o.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' $O | nc -q 2 127.0.0.1 "$PORT" | head -1 | tr -d '\r')
+expect_eq "userinfo(@) URI → 400" "$st" "HTTP/1.1 400 Bad Request"
+kill -INT $OP; wait $OP
+expect_eq "원 서버 꺼짐 → 502" "$(curl -s -o /dev/null -w '%{http_code}' -x "$PX" "http://127.0.0.1:$O/o.txt")" "502"
+expect_eq "없는 도메인 → 502" "$(curl -s -o /dev/null -w '%{http_code}' -x "$PX" "http://no-such-host.invalid/")" "502"
+expect_eq "-f여도 일반 요청은 직접 처리" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")" "200"
+stop_server
+rm -rf "$FP"
+
 echo
 echo "결과: 통과 $PASS, 실패 $FAIL"
 [ "$FAIL" -eq 0 ]

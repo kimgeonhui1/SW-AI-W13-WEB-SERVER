@@ -112,7 +112,24 @@ curl -x 127.0.0.1:8080 http://127.0.0.1:8001/index.html           # Forward
 - 백엔드 응답 검사: 상태 줄 형식, 값이 다른 중복 `Content-Length`, 헤더 64KB 초과 → 502. 응답 헤더를 5초 안에 다 못 받으면 504
 - 설정 파일 형식이 틀리면 줄 번호를 출력하고 시작하지 않는다 (exit 1)
 - 성능: 백엔드 2개, 동시 100연결 초당 약 13,000건 (백엔드 루트는 Linux 디스크)
-- 한계: 1xx 중간 응답 미지원(502), 백엔드 연결 재사용 없음, `X-Forwarded-For` 미추가, 블로킹 `connect`(응답 없는 호스트면 커널 기본 시간까지 대기)
+- 한계: 1xx 중간 응답 미지원(502), 백엔드 연결 재사용 없음, `X-Forwarded-For` 미추가 (연결 시간 제한 5초는 Forward Proxy와 공통)
+
+## Forward Proxy 동작
+
+`-f`로 켤 때만 동작 (끄면 절대 URI 요청은 403 — 의도치 않게 열린 프록시가 되지 않도록)
+
+- 클라이언트가 프록시를 쓰면 요청 라인에 전체 URL이 온다: `GET http://127.0.0.1:8001/a.html?x=1 HTTP/1.1`
+- URL을 host / port(기본 80) / 경로로 나눠 원 서버에 접속하고, **경로만** 담아 보낸다: `GET /a.html?x=1 HTTP/1.1`
+- `Host`는 URL의 `host[:port]`로 바꾼다 (클라이언트가 보낸 Host와 다르면 URL이 기준). `#조각`은 보내지 않는다
+- `Proxy-Authorization` 등 프록시 구간 헤더는 원 서버로 넘기지 않는다
+- 응답 중계·keep-alive·502/504 규칙은 Reverse Proxy와 같은 `proxy_relay`를 쓴다
+- 연결 시간 제한 5초: 패킷을 버리는 호스트에도 워커가 오래 묶이지 않는다 (non-blocking `connect` + `poll`) → 504
+- 오류: URL 형식 오류·`user@host` 형태 400, DNS 실패·연결 거부 502, 연결·응답 시간 초과 504
+- 한계: `https://`(CONNECT 터널) 미지원, DNS 조회 시간 제한 없음, 접속 대상 제한 없음(localhost·사설망 포함 — 신뢰하는 환경에서만 `-f`)
+
+```bash
+curl -x 127.0.0.1:8080 http://127.0.0.1:8001/index.html
+```
 
 ## 성능 측정 (wrk, 10초, keep-alive, 워커 8개, `GET /` 306바이트)
 

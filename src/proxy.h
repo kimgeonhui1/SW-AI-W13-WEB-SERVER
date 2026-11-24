@@ -13,11 +13,12 @@
 
 // 공통 (Reverse·Forward 모두 사용): 이미 연결된 upstreamfd로 요청을 보내고 응답을 clientfd로 중계
 //  - target = 요청 라인에 넣을 경로 ("/a.html?x=1")
-//  - 요청: hop-by-hop 헤더(Connection, Keep-Alive, Proxy-Connection, TE, Trailer, Upgrade)를 빼고 Connection: close
+//  - host = NULL이면 클라이언트의 Host 헤더 그대로(Reverse), 아니면 이 값으로 바꿔 보냄(Forward: URI의 host[:port])
+//  - 요청: hop-by-hop 헤더(Connection, Keep-Alive, Proxy-Connection, Proxy-Authorization, TE, Trailer, Upgrade)를 빼고 Connection: close
 //  - 응답: 상태 줄을 검사하고 hop-by-hop 헤더를 바꿔 Connection을 다시 붙인다
 //    본문 길이를 알면(Content-Length, HEAD, 204, 304) 그만큼만 보내고 클라이언트 keep-alive 유지,
 //    모르면(Transfer-Encoding, 길이 없음) 백엔드가 닫을 때까지 보내고 -1 (클라이언트도 닫아야 끝을 알 수 있음)
-int proxy_relay(int clientfd, int upstreamfd, const http_request *req, const char *target);
+int proxy_relay(int clientfd, int upstreamfd, const http_request *req, const char *target, const char *host);
 
 // Reverse Proxy: r의 백엔드를 Round-Robin으로 골라 전달. 연결이 안 되면 다음 백엔드, 모두 실패하면 502
 int reverse_proxy_request(int clientfd, const http_request *req, route *r);

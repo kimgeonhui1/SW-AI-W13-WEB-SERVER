@@ -143,7 +143,7 @@ void server_configure(const server_config *cfg) {
 static int dispatch(int connfd, const http_request *req) {
     if (is_absolute_uri(req->uri)) {            // "GET http://host/..." = Forward Proxy 요청
         if (!g_cfg->forward_enabled) return 403;    // -f 없이 열린 프록시가 되지 않도록
-        return 501;                             // TODO(7단계): forward_proxy_request
+        return forward_proxy_request(connfd, req);
     }
     // 라우팅 규칙에 맞으면 백엔드로 (CGI·정적 파일보다 먼저: 설정한 경로는 이 서버가 직접 처리하지 않는다)
     route *r = match_route(&g_routes, req->path);

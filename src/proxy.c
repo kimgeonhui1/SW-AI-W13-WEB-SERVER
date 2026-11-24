@@ -16,7 +16,9 @@
 
 // 한 구간(홉)에만 의미가 있는 헤더: 프록시는 이것을 다음 구간으로 넘기지 않고 자기 값으로 바꾼다 (RFC 9110 7.6.1)
 static int is_hop_by_hop(const char *name) {
-    static const char *const hop[] = { "Connection", "Keep-Alive", "Proxy-Connection", "TE", "Trailer", "Upgrade" };
+    // Proxy-Authorization: 프록시용 인증 정보. 원 서버로 넘기면 자격 증명이 새어 나간다
+    static const char *const hop[] = { "Connection", "Keep-Alive", "Proxy-Connection", "Proxy-Authorization",
+                                       "TE", "Trailer", "Upgrade" };
     for (size_t i = 0; i < sizeof(hop) / sizeof(hop[0]); i++)
         if (strcasecmp(name, hop[i]) == 0) return 1;
     return 0;
@@ -41,13 +43,16 @@ static int sb_append(sbuf *b, const char *s, size_t n) {
 static int sb_puts(sbuf *b, const char *s) { return sb_append(b, s, strlen(s)); }
 
 // 요청을 백엔드로: "메서드 target 버전" + 헤더(hop-by-hop 제외) + Connection: close + 빈 줄 + 본문
-static int send_upstream_request(int upfd, const http_request *req, const char *target) {
+static int send_upstream_request(int upfd, const http_request *req, const char *target, const char *host) {
     sbuf b = { NULL, 0, 0, 1024 * 1024 };
     int bad = 0;
     bad |= sb_puts(&b, req->method) | sb_puts(&b, " ") | sb_puts(&b, target) | sb_puts(&b, " ")
          | sb_puts(&b, req->version) | sb_puts(&b, "\r\n");
+    // Forward: Host는 요청 URI의 host[:port]로 (RFC 9112 3.2.2 — 절대 URI와 Host가 다르면 URI가 기준)
+    if (host != NULL) bad |= sb_puts(&b, "Host: ") | sb_puts(&b, host) | sb_puts(&b, "\r\n");
     for (int i = 0; i < req->header_count; i++) {
         if (is_hop_by_hop(req->headers[i].name)) continue;
+        if (host != NULL && strcasecmp(req->headers[i].name, "Host") == 0) continue;
         bad |= sb_puts(&b, req->headers[i].name) | sb_puts(&b, ": ") | sb_puts(&b, req->headers[i].value)
              | sb_puts(&b, "\r\n");
     }
@@ -78,7 +83,7 @@ static long long parse_length(const char *v) {
 
 static int is_timeout(void) { return errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT; }
 
-int proxy_relay(int clientfd, int upstreamfd, const http_request *req, const char *target) {
+int proxy_relay(int clientfd, int upstreamfd, const http_request *req, const char *target, const char *host) {
     if (clientfd < 0 || upstreamfd < 0 || req == NULL || target == NULL) return 502;
 
     // 백엔드가 멈춰도 워커가 영원히 붙잡히지 않게: read·write 한 번의 대기 제한
@@ -88,7 +93,7 @@ int proxy_relay(int clientfd, int upstreamfd, const http_request *req, const cha
     int one = 1;   // 헤더와 본문을 따로 write하므로 Nagle을 끄지 않으면 지연 ACK와 겹쳐 ~40ms 멈춤 (server.c와 같은 이유)
     setsockopt(upstreamfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    if (send_upstream_request(upstreamfd, req, target) != 0) return is_timeout() ? 504 : 502;
+    if (send_upstream_request(upstreamfd, req, target, host) != 0) return is_timeout() ? 504 : 502;
 
     // ── 응답 헤더: 상태 줄 + 헤더를 모아 검사한 뒤 한 번에 보낸다 (아직 클라이언트에 보낸 게 없으므로 오류면 502/504 가능)
     rio_t rio;
@@ -189,7 +194,7 @@ int reverse_proxy_request(int clientfd, const http_request *req, route *r) {
         int upfd = open_clientfd(b->host, b->port);
         if (upfd < 0) continue;
         // 경로는 바꾸지 않고 원래 URI(경로 + 쿼리)를 그대로 넘긴다 ("/api/x" → 백엔드의 "/api/x")
-        int rc = proxy_relay(clientfd, upfd, req, req->uri);
+        int rc = proxy_relay(clientfd, upfd, req, req->uri, NULL);
         close(upfd);
         return rc;
     }

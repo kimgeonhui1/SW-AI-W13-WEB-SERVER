@@ -14,12 +14,14 @@
 // URI가 "http://"로 시작(대소문자 무시)하면 1 — Forward Proxy 요청
 int is_absolute_uri(const char *uri);
 
-// "http://host[:port]/path?query" 분해 → host, port(없으면 "80"), path(없으면 "/", 쿼리 포함)
-// 성공 0, 형식 오류(호스트 없음, 포트 범위 밖, 버퍼 부족, http:// 아님) -1
+// "http://host[:port]/path?query" 분해 → host, port(없거나 비면 "80"), path(없으면 "/", 쿼리 포함, '#' 뒤 제외)
+// IPv6는 "http://[::1]:8080/" → host "::1"
+// 성공 0, 형식 오류(호스트 없음, 포트 범위 밖, userinfo '@', 버퍼 부족, http:// 아님) -1
 int parse_absolute_uri(const char *uri, char *host, size_t hostlen,
                        char *port, size_t portlen, char *path, size_t pathlen);
 
-// 원 서버에 연결해 req를 전달하고 응답을 clientfd로 중계. 응답 후 클라이언트 연결은 닫는다
+// 원 서버에 연결해 req를 전달하고 응답을 clientfd로 중계 (요청 라인은 경로만, Host는 URI의 authority로)
+// 반환 규약은 proxy.h의 proxy_relay와 같음. URI 형식 오류 400, 연결 실패 502, 연결 시간 초과 504
 int forward_proxy_request(int clientfd, const http_request *req);
 
 #endif
