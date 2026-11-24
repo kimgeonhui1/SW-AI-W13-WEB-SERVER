@@ -191,6 +191,72 @@ static void test_file_sizes(void) {
     cleanup_fixture(base);
 }
 
+// 작은 파일 캐시: TTL 안에서는 메모리 내용, 지나면 다시 읽음 / 큰 파일은 캐시 안 함 / 루트가 다르면 섞이지 않음
+static void test_small_file_cache(void) {
+    char base[256], root[300], base2[256], root2[300], path[512];
+    setup_fixture(base, sizeof(base), root, sizeof(root));
+    setup_fixture(base2, sizeof(base2), root2, sizeof(root2));
+    static char resp[200000];
+    size_t len;
+    int rc;
+
+    snprintf(path, sizeof(path), "%s/c.txt", root);
+    write_file(path, "v1");
+    char *body = get_and_collect(root, "/c.txt", resp, sizeof(resp), &len, &rc);
+    CHECK(rc == 0 && body != NULL && strncmp(body, "v1", 2) == 0);
+    write_file(path, "v2-longer");                                    // 파일을 바꿔도
+    body = get_and_collect(root, "/c.txt", resp, sizeof(resp), &len, &rc);
+    CHECK(rc == 0 && body != NULL && (size_t)(resp + len - body) == 2 && strncmp(body, "v1", 2) == 0);   // TTL 안 → 캐시
+    CHECK(memmem(resp, len, "Content-Length: 2\r\n", 19) != NULL);
+    usleep(1100 * 1000);                                              // TTL(1초) 지남
+    body = get_and_collect(root, "/c.txt", resp, sizeof(resp), &len, &rc);
+    CHECK(rc == 0 && body != NULL && (size_t)(resp + len - body) == 9 && strncmp(body, "v2-longer", 9) == 0);
+
+    // HEAD도 캐시에서: 길이는 같고 본문 없음
+    {
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        http_request req = { 0 };
+        snprintf(req.method, sizeof(req.method), "HEAD");
+        snprintf(req.path, sizeof(req.path), "/c.txt");
+        CHECK(serve_static(sv[0], root, &req) == 0);
+        close(sv[0]);
+        char hb[512] = { 0 };
+        ssize_t n = read(sv[1], hb, sizeof(hb) - 1);
+        close(sv[1]);
+        CHECK(n > 0 && strstr(hb, "Content-Length: 9\r\n") != NULL);
+        CHECK(n > 0 && hb[n - 1] == '\n' && strstr(hb, "v2") == NULL);
+    }
+
+    // 같은 경로라도 루트가 다르면 다른 파일 (/index.html: "<h1>Home</h1>" vs 바꾼 내용)
+    snprintf(path, sizeof(path), "%s/index.html", root2);
+    write_file(path, "root2");
+    body = get_and_collect(root, "/index.html", resp, sizeof(resp), &len, &rc);
+    CHECK(rc == 0 && body != NULL && strncmp(body, "<h1>Home</h1>", 13) == 0);
+    body = get_and_collect(root2, "/index.html", resp, sizeof(resp), &len, &rc);
+    CHECK(rc == 0 && body != NULL && strncmp(body, "root2", 5) == 0);
+
+    // 64KB보다 큰 파일은 캐시하지 않아 바뀐 내용이 바로 보임
+    static char big[70000];
+    memset(big, 'A', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+    snprintf(path, sizeof(path), "%s/big.txt", root);
+    write_file(path, big);
+    body = get_and_collect(root, "/big.txt", resp, sizeof(resp), &len, &rc);
+    CHECK(rc == 0 && body != NULL && body[0] == 'A');
+    memset(big, 'B', sizeof(big) - 1);
+    write_file(path, big);
+    body = get_and_collect(root, "/big.txt", resp, sizeof(resp), &len, &rc);
+    CHECK(rc == 0 && body != NULL && body[0] == 'B' && (size_t)(resp + len - body) == sizeof(big) - 1);
+
+    // 경로 탈출은 캐시와 무관하게 계속 403 (캐시에는 검사를 통과한 파일만 들어감)
+    CHECK(serve_expect_error(root, "GET", "/escape_link") == 403);
+    CHECK(serve_expect_error(root, "GET", "/escape_link") == 403);
+
+    cleanup_fixture(base);
+    cleanup_fixture(base2);
+}
+
 static void test_serve_static_cases(void) {
     char base[256], root[300];
     setup_fixture(base, sizeof(base), root, sizeof(root));
@@ -348,6 +414,7 @@ int main(void) {
     test_fifo_not_served();
     test_header_injection_rejected();
     test_file_sizes();
+    test_small_file_cache();
     test_serve_static_cases();
     return TEST_RESULT();
 }

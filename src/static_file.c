@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,30 @@
 #include <unistd.h>
 
 #define STATIC_BUF_SIZE 65536
+
+// 작은 파일 메모리 캐시 (스레드별, 락 없음)
+// 이유: WSL의 /mnt/c(9P)에서는 realpath·open이 각각 ~1.6ms라 요청마다 파일 시스템을 거치면 초당 ~3,000건에서 막힌다.
+//       같은 파일을 짧은 시간 안에 다시 요청하면 시스템 콜 없이 메모리에서 바로 보낸다
+// shortcut: 파일이 바뀌거나 지워져도 최대 CACHE_TTL_SEC 동안 이전 내용을 보낸다. 즉시 반영이 필요하면 TTL을 0으로(캐시 끔)
+#define CACHE_SLOTS    64              // 스레드당 칸 수 (경로 해시로 바로 찾아가고, 충돌하면 덮어씀)
+#define CACHE_MAX_FILE 65536           // 이보다 큰 파일은 캐시하지 않고 매번 읽어 보낸다 (메모리 상한: 워커 수 × 64칸 × 64KB)
+#define CACHE_TTL_SEC  1.0
+
+typedef struct {
+    char key[PATH_MAX + 1];            // 루트 + '\n' + 요청 경로 (루트가 다른 서버·테스트끼리 섞이지 않게)
+    char *data;                        // 파일 내용 (NULL이면 빈 칸)
+    size_t len;
+    const char *mime;                  // mime_type_from_path가 돌려준 정적 문자열
+    double expires;                    // rio_now() 기준 만료 시각
+} cache_entry;
+
+static __thread cache_entry t_cache[CACHE_SLOTS];
+
+static unsigned int cache_hash(const char *s) {
+    unsigned int h = 2166136261u;      // FNV-1a
+    for (; *s; s++) h = (h ^ (unsigned char)*s) * 16777619u;
+    return h % CACHE_SLOTS;
+}
 
 static int is_within_root(const char *resolved_root, const char *resolved_target) {
     size_t root_len = strlen(resolved_root);
@@ -54,6 +79,37 @@ static const char *resolve_root_cached(const char *root) {
     return cached_out;
 }
 
+// 워커 스레드가 끝날 때 그 스레드의 캐시 메모리를 해제 (__thread 변수는 스레드가 끝나면 포인터만 사라져 누수가 됨)
+static pthread_key_t g_cache_key;
+static pthread_once_t g_cache_once = PTHREAD_ONCE_INIT;
+static void cache_free_thread(void *p) {
+    cache_entry *c = p;
+    for (int i = 0; i < CACHE_SLOTS; i++) {
+        free(c[i].data);
+        c[i].data = NULL;
+    }
+}
+static void cache_key_init(void) { pthread_key_create(&g_cache_key, cache_free_thread); }
+
+static cache_entry *cache_find(const char *key) {
+    cache_entry *e = &t_cache[cache_hash(key)];
+    if (e->data != NULL && rio_now() < e->expires && strcmp(e->key, key) == 0) return e;
+    return NULL;
+}
+
+// data의 소유권을 캐시로 넘긴다 (같은 칸의 이전 내용은 해제)
+static void cache_put(const char *key, char *data, size_t len, const char *mime) {
+    pthread_once(&g_cache_once, cache_key_init);
+    pthread_setspecific(g_cache_key, t_cache);   // 이 스레드가 끝날 때 cache_free_thread가 불리도록
+    cache_entry *e = &t_cache[cache_hash(key)];
+    free(e->data);
+    snprintf(e->key, sizeof(e->key), "%s", key);
+    e->data = data;
+    e->len = len;
+    e->mime = mime;
+    e->expires = rio_now() + CACHE_TTL_SEC;
+}
+
 // open/realpath 실패 errno → HTTP 상태 코드
 static int status_from_errno(int e) {
     if (e == ENOENT || e == ENOTDIR) return 404;
@@ -76,6 +132,18 @@ int serve_static(int fd, const char *root, const http_request *req) {
     const char *req_path = (req->path[0] != '\0') ? req->path : "/";
     if (req_path[0] != '/') {
         return 400;
+    }
+
+    // 캐시 확인: 최근(CACHE_TTL_SEC 안)에 이 스레드가 보낸 작은 파일이면 파일 시스템을 거치지 않는다
+    // (경로 탈출·권한 검사는 캐시에 넣기 전에 이미 통과한 것만 들어 있다)
+    char key[PATH_MAX + 1];
+    int klen = snprintf(key, sizeof(key), "%s\n%s", root, req_path);
+    int keyed = (klen > 0 && (size_t)klen < sizeof(key));
+    cache_entry *hit = keyed ? cache_find(key) : NULL;
+    if (hit != NULL) {
+        if (send_headers(fd, 200, hit->mime, hit->len, req->keep_alive) != 0) return -1;
+        if (is_head || hit->len == 0) return 0;
+        return rio_writen(fd, hit->data, hit->len) == (ssize_t)hit->len ? 0 : -1;
     }
 
     const char *resolved_root = resolve_root_cached(root);
@@ -122,7 +190,30 @@ int serve_static(int fd, const char *root, const http_request *req) {
     }
 
     size_t file_size = (size_t)st.st_size;
-    if (send_headers(fd, 200, mime_type_from_path(resolved_target), file_size, req->keep_alive) != 0) {
+    const char *mime = mime_type_from_path(resolved_target);
+
+    // 작은 파일: 통째로 읽어 캐시에 넣고 보낸다. 다 못 읽으면(읽는 중에 파일이 줄어듦 등) 캐시하지 않고 500
+    if (keyed && file_size <= CACHE_MAX_FILE) {
+        char *data = malloc(file_size > 0 ? file_size : 1);
+        size_t got = 0;
+        while (data != NULL && got < file_size) {
+            ssize_t r = read(file_fd, data + got, file_size - got);
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) break;
+            got += (size_t)r;
+        }
+        close(file_fd);
+        if (data == NULL || got != file_size) {
+            free(data);
+            return 500;
+        }
+        cache_put(key, data, file_size, mime);
+        if (send_headers(fd, 200, mime, file_size, req->keep_alive) != 0) return -1;
+        if (is_head || file_size == 0) return 0;
+        return rio_writen(fd, data, file_size) == (ssize_t)file_size ? 0 : -1;
+    }
+
+    if (send_headers(fd, 200, mime, file_size, req->keep_alive) != 0) {
         close(file_fd);
         return -1;
     }
