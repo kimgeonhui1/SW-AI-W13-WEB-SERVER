@@ -121,7 +121,8 @@ int open_clientfd(const char *host, const char *port) {
             } else if (pr > 0) {
                 int err = 0;
                 socklen_t len = sizeof(err);
-                getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);   // 연결 결과 (0이면 성공)
+                // 연결 결과 (0이면 성공). 조회 자체가 실패하면 성공으로 오인하지 않도록 그 errno를 결과로
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) err = errno ? errno : EIO;
                 ok = (err == 0);
                 errno = err;
             }

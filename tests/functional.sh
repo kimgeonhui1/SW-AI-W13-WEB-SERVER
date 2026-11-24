@@ -401,6 +401,8 @@ expect_eq "스킴 대소문자 무시 + Host가 달라도 URI 기준" "$raw" "or
 # curl은 userinfo를 URI에서 빼서 보내므로 nc로 직접
 st=$(printf 'GET http://a@127.0.0.1:%s/o.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' $O | nc -q 2 127.0.0.1 "$PORT" | head -1 | tr -d '\r')
 expect_eq "userinfo(@) URI → 400" "$st" "HTTP/1.1 400 Bad Request"
+# 프록시가 자기 자신을 대상으로 받아도 원 서버엔 경로만("GET /") 보내므로 다시 프록시 요청이 되지 않는다 (루프 없음)
+expect_eq "자기 자신을 대상으로 → 한 번만 거쳐 정적 파일" "$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' -x "$PX" "http://127.0.0.1:$PORT/")" "200"
 kill -INT $OP; wait $OP
 expect_eq "원 서버 꺼짐 → 502" "$(curl -s -o /dev/null -w '%{http_code}' -x "$PX" "http://127.0.0.1:$O/o.txt")" "502"
 expect_eq "없는 도메인 → 502" "$(curl -s -o /dev/null -w '%{http_code}' -x "$PX" "http://no-such-host.invalid/")" "502"
