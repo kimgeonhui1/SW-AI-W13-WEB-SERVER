@@ -247,6 +247,12 @@ int parse_header_line(const char *line, http_request *req) {
         vlen--;
     }
     if (vlen >= MAX_HEADER_VALUE) return 431;
+    // 값 안의 제어 문자(특히 줄 중간의 CR) 거부 (RFC 9112 2.2): 프록시가 이 값을 백엔드로 넘기면
+    // 백엔드가 CR을 줄바꿈으로 읽어 헤더가 하나 더 생긴 것처럼 보일 수 있다 (요청 밀반입)
+    for (size_t i = 0; i < vlen; i++) {
+        unsigned char c = (unsigned char)vstart[i];
+        if ((c < 0x20 && c != '\t') || c == 0x7f) return 400;
+    }
 
     // Host가 둘 이상이면 어느 호스트로 보낸 요청인지 모호 → 400 (RFC 7230 5.4). Content-Length 중복도 아래에서 400
     if (strcasecmp(buf, "Host") == 0 && get_header(req, "Host") != NULL) return 400;

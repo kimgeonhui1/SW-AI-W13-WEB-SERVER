@@ -101,9 +101,14 @@ int proxy_relay(int clientfd, int upstreamfd, const http_request *req, const cha
 
     // 상태 줄 "HTTP/1.x NNN ..." 검사
     int status = 0;
-    if (strncmp(line, "HTTP/1.", 7) != 0 || line[n - 1] != '\n' ||
-        sscanf(line + 8, " %3d", &status) != 1 || status < 100 || status > 599)
+    // "HTTP/1.x" + 공백 + 숫자 3개 + (공백 또는 줄 끝). "200abc"처럼 숫자 뒤에 글자가 붙으면 형식 오류
+    if (n < 13 || strncmp(line, "HTTP/1.", 7) != 0 || (line[7] != '0' && line[7] != '1') ||
+        line[n - 1] != '\n' || line[8] != ' ' ||
+        line[9] < '0' || line[9] > '9' || line[10] < '0' || line[10] > '9' || line[11] < '0' || line[11] > '9' ||
+        (line[12] != ' ' && line[12] != '\r' && line[12] != '\n'))
         return 502;
+    status = (line[9] - '0') * 100 + (line[10] - '0') * 10 + (line[11] - '0');
+    if (status < 100 || status > 599) return 502;
     if (status < 200) return 502;                           // shortcut: 1xx 중간 응답(100 Continue 등) 미지원
 
     sbuf hdr = { NULL, 0, 0, PROXY_MAX_RESP_HEADER };
@@ -122,10 +127,16 @@ int proxy_relay(int clientfd, int upstreamfd, const http_request *req, const cha
         while (*val == ' ' || *val == '\t') val++;
         char *end = val + strlen(val);
         while (end > val && (end[-1] == '\r' || end[-1] == '\n' || end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+        // 이름에 공백·제어 문자, 값에 제어 문자(줄 중간 CR 등)가 있으면 클라이언트 쪽 응답 헤더가 깨진다 → 502
+        int ctl = (line[0] == '\0');
+        for (const char *c = line; *c; c++) ctl |= ((unsigned char)*c <= 0x20 || *c == 0x7f);
+        for (const char *c = val; *c; c++) ctl |= (((unsigned char)*c < 0x20 && *c != '\t') || *c == 0x7f);
+        if (ctl) { free(hdr.p); return 502; }
         if (is_hop_by_hop(line)) continue;
         if (strcasecmp(line, "Content-Length") == 0) {
             long long v = parse_length(val);
             if (v < 0 || (clen >= 0 && v != clen)) { free(hdr.p); return 502; }   // 값이 다른 중복은 응답 경계를 믿을 수 없음
+            if (clen >= 0) continue;                         // 같은 값 중복은 하나로 합쳐 전달 (RFC 9112 6.3)
             clen = v;
         } else if (strcasecmp(line, "Transfer-Encoding") == 0) {
             chunked = 1;
@@ -133,6 +144,8 @@ int proxy_relay(int clientfd, int upstreamfd, const http_request *req, const cha
         bad |= sb_puts(&hdr, line) | sb_puts(&hdr, ": ") | sb_puts(&hdr, val) | sb_puts(&hdr, "\r\n");
     }
     if (bad) { free(hdr.p); return 502; }                   // 헤더가 너무 큼
+    // Transfer-Encoding과 Content-Length가 함께 오면 어느 쪽이 경계인지 모호 → 응답 분할 공격일 수 있어 거부 (RFC 9112 6.1)
+    if (chunked && clen >= 0) { free(hdr.p); return 502; }
 
     // 본문 길이 결정 (RFC 9112 6.3): HEAD·204·304는 본문 없음, Transfer-Encoding이면 끝까지, 아니면 Content-Length
     int is_head = (strcmp(req->method, "HEAD") == 0);

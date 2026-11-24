@@ -315,6 +315,13 @@ static void test_bad_responses(void) {
         { RESP("HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n") },
         { RESP("HTTP/1.1 200 OK\r\nContent-Length: 5") },             // 헤더 도중 끊김
         { bigh, off },                                                // 헤더 64KB 초과
+        { RESP("HTTP/1.1 200abc OK\r\nContent-Length: 0\r\n\r\n") },   // 상태 코드 뒤에 글자
+        { RESP("HTTP/1.1 2000 OK\r\nContent-Length: 0\r\n\r\n") },
+        { RESP("HTTP/1.1200 OK\r\nContent-Length: 0\r\n\r\n") },      // 버전과 상태 코드 사이 공백 없음
+        { RESP("HTTP/1.x 200 OK\r\nContent-Length: 0\r\n\r\n") },
+        { RESP("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n") },   // TE + CL
+        { RESP("HTTP/1.1 200 OK\r\nX-A: a\rX-Evil: 1\r\nContent-Length: 0\r\n\r\n") },   // 값 중간의 CR
+        { RESP("HTTP/1.1 200 OK\r\nContent-Length : 0\r\n\r\n") },    // 이름 뒤 공백
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         fake_backend *fb = fake_start(cases[i].resp, cases[i].len, 0, 1);
@@ -325,8 +332,16 @@ static void test_bad_responses(void) {
         CHECK(g_resp_len == 0);
         fake_stop(fb);
     }
-    // 같은 값의 중복 Content-Length는 허용
+    // 같은 값의 중복 Content-Length는 허용하되 클라이언트에는 하나만 (RFC 9112 6.3)
     fake_backend *fb = fake_start(RESP("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nok"), 0, 1);
+    make_req("GET", "/", 1);
+    CHECK(relay_via(fb, NULL) == 0);
+    char *first = strstr(g_resp, "Content-Length: 2\r\n");
+    CHECK(first != NULL && strstr(first + 1, "Content-Length") == NULL);
+    CHECK_STR(body_of(), "ok");
+    fake_stop(fb);
+    // 상태 코드 바로 뒤가 줄 끝이어도 정상 (이유 문구는 생략 가능)
+    fb = fake_start(RESP("HTTP/1.1 200\r\nContent-Length: 2\r\n\r\nok"), 0, 1);
     make_req("GET", "/", 1);
     CHECK(relay_via(fb, NULL) == 0);
     fake_stop(fb);

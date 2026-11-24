@@ -81,6 +81,11 @@ static void test_headers_and_connection(void) {
     CHECK(parse_header_line(" Content-Length: 10\r\n", &req) == 400);
     CHECK(parse_header_line("Content-Length: abc\r\n", &req) == 400);
     CHECK(parse_header_line("Content-Length: -5\r\n", &req) == 400);
+    // 값 안의 제어 문자: 프록시가 넘기면 백엔드가 CR을 줄바꿈으로 읽어 헤더가 늘어날 수 있음
+    CHECK(parse_header_line("X-A: a\rX-Evil: 1\r\n", &req) == 400);
+    CHECK(parse_header_line("X-A: a\x01" "b\r\n", &req) == 400);
+    CHECK(parse_header_line("X-A: a\x7f\r\n", &req) == 400);
+    CHECK(parse_header_line("X-A: a\tb\r\n", &req) == 0);              // 탭은 허용
 
     // close와 keep-alive가 함께 오면 close가 이긴다 (순서·대소문자·여러 헤더 줄과 무관)
     http_request both = { 0 };

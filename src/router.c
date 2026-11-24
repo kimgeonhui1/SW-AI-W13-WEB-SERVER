@@ -46,6 +46,8 @@ int parse_route_line(const char *line, route *r) {
     char *save = NULL;
     for (char *tok = strtok_r(buf, " \t\r\n", &save); tok != NULL; tok = strtok_r(NULL, " \t\r\n", &save)) {
         if (tok[0] == '#') break;                          // 이후는 주석
+        // "/api/#x"처럼 토큰에 붙은 '#': URL 경로에는 '#'가 오지 않아 그 규칙은 영원히 안 맞으므로 설정 실수로 거부
+        if (strchr(tok, '#') != NULL) return -1;
         if (ntok == 0) {
             // prefix는 '/'로 시작해야 요청 경로와 비교할 수 있다
             if (tok[0] != '/' || strlen(tok) >= sizeof(r->prefix)) return -1;
@@ -83,6 +85,14 @@ int load_routes(const char *path, route_table *table) {
         if (pr == 0) continue;
         if (pr < 0) {
             fprintf(stderr, "%s:%d: invalid route (format: <prefix> <host:port> [host:port ...])\n", path, lineno);
+            rc = -1;
+            break;
+        }
+        // 같은 prefix가 두 번이면 뒤 규칙은 영원히 쓰이지 않는다 → 설정 실수로 보고 거부
+        int dup = 0;
+        for (int i = 0; i < table->count; i++) dup |= (strcmp(table->routes[i].prefix, r.prefix) == 0);
+        if (dup) {
+            fprintf(stderr, "%s:%d: duplicate prefix %s\n", path, lineno, r.prefix);
             rc = -1;
             break;
         }

@@ -47,6 +47,8 @@ static void test_parse_route_line_errors(void) {
     CHECK(parse_route_line("/v6/ [::1:9000", &r) == -1);             // 괄호 안 닫힘
     CHECK(parse_route_line("/x/ a:1 a:2 a:3 a:4 a:5 a:6 a:7 a:8 a:9", &r) == -1);   // 백엔드 9개
     CHECK(parse_route_line(NULL, &r) == -1);
+    CHECK(parse_route_line("/api/#x 127.0.0.1:8001", &r) == -1);    // 공백 없이 붙은 '#'
+    CHECK(parse_route_line("/api/ 127.0.0.1:8001#x", &r) == -1);
     char longp[400];
     memset(longp, 'a', sizeof(longp));
     longp[0] = '/';
@@ -140,6 +142,8 @@ static void test_load_routes(void) {
     CHECK_STR(t.routes[1].prefix, "/img/");
     CHECK(match_route(&t, "/img/a.png") == &t.routes[1]);
     write_conf(path, "/api/ 127.0.0.1:8001\n/bad/ nocolon\n");      // 2번째 줄 오류 → 전체 실패
+    CHECK(load_routes(path, &t) == -1);
+    write_conf(path, "/api/ h:1\n/api/ h:2\n");                      // 같은 prefix 두 번 → 뒤 규칙이 쓰일 수 없으니 오류
     CHECK(load_routes(path, &t) == -1);
     write_conf(path, "");                                            // 빈 파일 = 규칙 0개 (성공)
     CHECK(load_routes(path, &t) == 0 && t.count == 0);
