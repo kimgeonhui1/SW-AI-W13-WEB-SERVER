@@ -87,14 +87,20 @@ int open_clientfd(const char *host, const char *port) {
     int fd = -1;
 
     // host가 NULL이면 getaddrinfo가 루프백(localhost)을 돌려줘 엉뚱한 곳에 접속하므로 막는다. 포트 0도 접속 대상이 아님
-    if (host == NULL || *host == '\0' || !valid_port(port, 0)) return -1;
+    if (host == NULL || *host == '\0' || !valid_port(port, 0)) {
+        errno = EINVAL;
+        return -1;
+    }
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_ADDRCONFIG | AI_NUMERICSERV;
     // 호스트 이름이면 여기서 DNS 조회가 일어난다
     int rc = getaddrinfo(host, port, &hints, &list);
-    if (rc != 0) return -1;                 // DNS 실패 → 호출한 쪽(프록시)이 502로 처리
+    if (rc != 0) {
+        errno = EHOSTUNREACH;               // getaddrinfo는 errno를 설정하지 않으므로 직전 ETIMEDOUT이 남지 않게 명시
+        return -1;                          // DNS 실패 → 호출한 쪽(프록시)이 502로 처리
+    }
 
     // 블로킹 connect는 응답 없는 호스트(패킷을 버리는 방화벽 등)에서 커널 기본 시간(수십 초~2분)까지 워커를 붙잡는다
     // → non-blocking으로 connect를 시작하고 poll로 CONNECT_TIMEOUT_SEC까지만 기다린다 (후보 전체 합산)
