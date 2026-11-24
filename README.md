@@ -2,8 +2,6 @@
 
 POSIX 소켓 API만으로 처음부터 만드는 C 웹서버 + Forward / Reverse Proxy (WEEK13 팀 과제)
 
-> 현재 상태: **뼈대(skeleton)** — 모든 모듈의 인터페이스(헤더)와 빈 구현(`TODO`)만 있습니다.
-
 ## 설계 (팀 확정)
 
 | 항목 | 선택 | 이유 |
@@ -55,7 +53,7 @@ conf/routes.conf         Reverse Proxy 라우팅 규칙
 
 ## 빌드 · 실행
 
-WSL2(Ubuntu) / Linux / macOS
+WSL2(Ubuntu) / Linux / macOS (`tests/functional.sh`는 `/proc`·`ss`를 써서 Linux/WSL 전용)
 
 ```bash
 make            # bin/server, cgi-bin/adder
@@ -97,7 +95,7 @@ curl -x 127.0.0.1:8080 http://127.0.0.1:8001/index.html           # Forward
 - 서버의 모든 fd(클라이언트 연결 포함)는 CLOEXEC → CGI에 새지 않는다
 - `cgi_dir` 안의 심볼릭 링크는 따라간다 (Apache `FollowSymLinks`와 같음). `cgi_dir`에 파일을 둘 수 있는 사람은 어차피 임의 프로그램을 둘 수 있으므로 경계 검사로 막을 대상이 아니다. HTTP로는 `cgi_dir`에 파일을 만들 수 없다
 - 오류: 없음 404 · 실행 권한 없음 403 · 실행 실패 500 · 형식 오류/비정상 종료/출력 과다 502 · 시간 초과 504
-- 성능: `adder` 동시 100연결 초당 약 1,300건 (요청마다 프로세스 생성, `/mnt/c`의 실행 파일)
+- 성능: `adder` 동시 100연결 초당 약 1,250건 (요청마다 프로세스 생성, `/mnt/c`의 실행 파일)
 
 ## Reverse Proxy 동작
 
@@ -111,7 +109,7 @@ curl -x 127.0.0.1:8080 http://127.0.0.1:8001/index.html           # Forward
   - 클라이언트 쪽: 응답 길이를 알면(`Content-Length`, HEAD, 204, 304) **keep-alive 유지**, 모르면(chunked, 길이 없음) 백엔드가 닫을 때까지 보내고 닫는다
 - 백엔드 응답 검사: 상태 줄 형식, 값이 다른 중복 `Content-Length`, 헤더 64KB 초과 → 502. 응답 헤더를 5초 안에 다 못 받으면 504
 - 설정 파일 형식이 틀리면 줄 번호를 출력하고 시작하지 않는다 (exit 1)
-- 성능: 백엔드 2개, 동시 100연결 초당 약 13,000건 (백엔드 루트는 Linux 디스크)
+- 성능: 백엔드 2개, 동시 100연결 초당 약 16,800건 (백엔드 루트는 Linux 디스크)
 - 한계: 1xx 중간 응답 미지원(502), 백엔드 연결 재사용 없음, `X-Forwarded-For` 미추가 (연결 시간 제한 5초는 Forward Proxy와 공통)
 
 ## Forward Proxy 동작
