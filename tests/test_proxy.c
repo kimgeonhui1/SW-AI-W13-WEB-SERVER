@@ -321,6 +321,8 @@ static void test_bad_responses(void) {
         { RESP("HTTP/1.1200 OK\r\nContent-Length: 0\r\n\r\n") },      // 버전과 상태 코드 사이 공백 없음
         { RESP("HTTP/1.x 200 OK\r\nContent-Length: 0\r\n\r\n") },
         { RESP("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n") },   // TE + CL
+        { RESP("HTTP/1.1 200 OK\rX-Evil: 1\r\nContent-Length: 0\r\n\r\n") },   // 상태 줄 중간의 CR
+        { RESP("HTTP/1.1 200 OK\x01\r\nContent-Length: 0\r\n\r\n") },          // 상태 줄 제어 문자
         { RESP("HTTP/1.1 200 OK\r\nX-A: a\rX-Evil: 1\r\nContent-Length: 0\r\n\r\n") },   // 값 중간의 CR
         { RESP("HTTP/1.1 200 OK\r\nContent-Length : 0\r\n\r\n") },    // 이름 뒤 공백
     };
@@ -411,6 +413,109 @@ static void test_reverse_round_robin_failover(void) {
     CHECK(g_resp_len == 0);
 }
 
+// 길이 없는 응답 스트리밍: 1바이트 보내고 2초 멈추는 백엔드 → 16KB를 기다리지 않고 1초 안에 클라이언트가 받음
+typedef struct { int cfd; int upfd; const http_request *req; int rc; } stream_arg;
+static void *stream_relay_main(void *p) {
+    stream_arg *a = p;
+    a->rc = proxy_relay(a->cfd, a->upfd, a->req, a->req->uri, NULL);
+    close(a->upfd);
+    close(a->cfd);
+    return NULL;
+}
+
+static void test_stream_no_buffering(void) {
+    fake_backend *fb = fake_start(RESP("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nX"), 2000, 1);
+    make_req("GET", "/stream", 1);
+    int sv[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    int up = open_clientfd("127.0.0.1", fb->port);
+    CHECK(up >= 0);
+    stream_arg a = { .cfd = sv[1], .upfd = up, .req = &g_req, .rc = 0 };
+    double t0 = rio_now();
+    pthread_t t;
+    pthread_create(&t, NULL, stream_relay_main, &a);
+
+    char buf[512];
+    size_t len = 0;
+    double first_body_el = -1.0;
+    while (len < sizeof(buf) - 1) {
+        ssize_t n = read(sv[0], buf + len, sizeof(buf) - 1 - len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        len += (size_t)n;
+        buf[len] = '\0';
+        char *sep = strstr(buf, "\r\n\r\n");
+        if (first_body_el < 0 && sep != NULL && sep[4] != '\0') {
+            first_body_el = rio_now() - t0;
+        }
+    }
+    close(sv[0]);
+    pthread_join(t, NULL);
+    CHECK(a.rc == -1);
+    CHECK(first_body_el >= 0 && first_body_el < 1.0);
+    char *sep = strstr(buf, "\r\n\r\n");
+    CHECK(sep != NULL && strcmp(sep + 4, "X") == 0);
+    fake_stop(fb);
+}
+
+// 죽은 백엔드 + 살아 있는 백엔드에 여러 스레드가 동시 요청 → 같은 장애 백엔드만 중복 시도해 502가 나면 안 됨
+typedef struct { route *r; int iters; int fails; } conc_failover_arg;
+static void *conc_failover_worker(void *p) {
+    conc_failover_arg *a = p;
+    http_request *req = calloc(1, sizeof(*req));
+    if (req == NULL) { a->fails = a->iters; return NULL; }
+    snprintf(req->method, sizeof(req->method), "GET");
+    snprintf(req->uri, sizeof(req->uri), "/api/x");
+    snprintf(req->path, sizeof(req->path), "/api/x");
+    snprintf(req->version, sizeof(req->version), "HTTP/1.1");
+    req->keep_alive = 1;
+    for (int i = 0; i < a->iters; i++) {
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) { a->fails++; continue; }
+        int rc = reverse_proxy_request(sv[1], req, a->r);
+        close(sv[1]);
+        char buf[256];
+        size_t got = 0;
+        for (;;) {
+            ssize_t n = read(sv[0], buf + got, sizeof(buf) - 1 - got);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            got += (size_t)n;
+        }
+        buf[got] = '\0';
+        close(sv[0]);
+        char *sep = strstr(buf, "\r\n\r\n");
+        if (rc != 0 || sep == NULL || strcmp(sep + 4, "C") != 0) a->fails++;
+    }
+    free(req);
+    return NULL;
+}
+
+static void test_reverse_concurrent_failover(void) {
+    enum { NTHREADS = 8, ITERS = 8 };
+    char dead[8];
+    dead_port(dead, sizeof(dead));
+    fake_backend *alive = fake_start(RESP("HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nC"), 0, NTHREADS * ITERS);
+    route r;
+    char line[128];
+    snprintf(line, sizeof(line), "/api/ 127.0.0.1:%s 127.0.0.1:%s", dead, alive->port);
+    CHECK(parse_route_line(line, &r) == 1);
+
+    pthread_t th[NTHREADS];
+    conc_failover_arg args[NTHREADS];
+    for (int i = 0; i < NTHREADS; i++) {
+        args[i] = (conc_failover_arg){ .r = &r, .iters = ITERS, .fails = 0 };
+        pthread_create(&th[i], NULL, conc_failover_worker, &args[i]);
+    }
+    int total_fails = 0;
+    for (int i = 0; i < NTHREADS; i++) {
+        pthread_join(th[i], NULL);
+        total_fails += args[i].fails;
+    }
+    CHECK(total_fails == 0);
+    fake_stop(alive);
+}
+
 // ───────────── Forward Proxy ─────────────
 static int forward_once(void) {
     int sv[2];
@@ -471,6 +576,13 @@ static void test_forward_errors(void) {
     make_req("GET", "http://no-such-host.invalid/", 1);
     CHECK(forward_once() == 502);                                       // DNS 실패 (.invalid는 존재하지 않는 도메인으로 예약됨)
     CHECK(g_resp_len == 0);
+    // 직전 errno가 ETIMEDOUT으로 남아 있어도 DNS 실패는 504가 아니라 502
+    int sv[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    errno = ETIMEDOUT;
+    CHECK(forward_proxy_request(sv[1], &g_req) == 502);
+    close(sv[1]);
+    close(sv[0]);
 }
 
 // 연결을 받지 않는 호스트(SYN을 버림) → CONNECT_TIMEOUT_SEC 뒤 504
@@ -524,6 +636,8 @@ int main(void) {
     test_truncated();
     test_bad_responses();
     test_reverse_round_robin_failover();
+    test_reverse_concurrent_failover();
+    test_stream_no_buffering();
     test_timeout();
     test_header_drip();
     test_forward_rewrite();
