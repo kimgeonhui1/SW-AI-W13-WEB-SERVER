@@ -115,6 +115,13 @@ int proxy_relay(int clientfd, int upstreamfd, const http_request *req, const cha
     status = (line[9] - '0') * 100 + (line[10] - '0') * 10 + (line[11] - '0');
     if (status < 100 || status > 599) return 502;
     if (status < 200) return 502;                           // shortcut: 1xx 중간 응답(100 Continue 등) 미지원
+    // 상태 줄 reason 문구에 줄 끝 CRLF/LF 외의 제어 문자(줄 중간 CR 등)가 있으면 클라이언트 쪽 헤더가 깨진다 → 502
+    size_t slen = (size_t)n - 1;
+    if (slen > 0 && line[slen - 1] == '\r') slen--;
+    for (size_t i = 12; i < slen; i++) {
+        unsigned char c = (unsigned char)line[i];
+        if ((c < 0x20 && c != '\t') || c == 0x7f) return 502;
+    }
 
     sbuf hdr = { NULL, 0, 0, PROXY_MAX_RESP_HEADER };
     int bad = sb_append(&hdr, line, (size_t)n);
@@ -170,17 +177,27 @@ int proxy_relay(int clientfd, int upstreamfd, const http_request *req, const cha
 
     // ── 본문: 이제부터는 이미 200 등을 보냈으므로 실패하면 연결을 끊는 것밖에 할 수 없다 (-1)
     rio.deadline = 0;                                        // 큰 본문은 오래 걸릴 수 있으니 read 한 번 제한(SO_RCVTIMEO)만
-    char buf[16384];
     long long left = body_len;
+    // 헤더를 읽을 때 rio 내부 버퍼에 미리 들어온 본문 앞부분부터 먼저 보낸다
+    if (left != 0 && rio.cnt > 0) {
+        size_t take = (size_t)rio.cnt;
+        if (left > 0 && (long long)take > left) take = (size_t)left;
+        if (rio_writen(clientfd, rio.bufp, take) != (ssize_t)take) return -1;
+        rio.bufp += take;
+        rio.cnt -= (ssize_t)take;
+        if (left > 0) left -= (long long)take;
+    }
+    // 이후는 read 한 번의 결과를 바로 전달 (rio_readnb는 16KB가 찰 때까지 기다려 스트리밍 응답이 지연됨)
+    char buf[16384];
     while (left != 0) {
         size_t want = sizeof(buf);
         if (left > 0 && (long long)want > left) want = (size_t)left;
-        ssize_t r = rio_readnb(&rio, buf, want);
+        ssize_t r;
+        do { r = read(upstreamfd, buf, want); } while (r < 0 && errno == EINTR);
         if (r < 0) return -1;                                // 백엔드 시간 초과·에러
         if (r == 0) break;                                   // 백엔드가 닫음
         if (rio_writen(clientfd, buf, (size_t)r) != r) return -1;
         if (left > 0) left -= r;
-        if ((size_t)r < want) break;                         // rio_readnb가 덜 읽음 = EOF
     }
     if (body_len > 0 && left > 0) return -1;                 // 약속한 길이보다 일찍 끊김 → 클라이언트도 끊어 잘린 것을 알림
     return keep ? 0 : -1;
@@ -188,9 +205,10 @@ int proxy_relay(int clientfd, int upstreamfd, const http_request *req, const cha
 
 int reverse_proxy_request(int clientfd, const http_request *req, route *r) {
     if (clientfd < 0 || req == NULL || r == NULL || r->backend_count <= 0) return 502;
-    // 다음 차례 백엔드부터 시도하고, 연결이 안 되면(꺼짐 등) 다른 백엔드로 넘어간다 — 각 백엔드 최대 한 번
+    // 시작 인덱스를 한 번만 원자적으로 받은 뒤 차례로 시도 — 멀티스레드 경합 중에도 각 백엔드를 정확히 한 번씩 시도
+    unsigned int start = next_backend_index(r);
     for (int tries = 0; tries < r->backend_count; tries++) {
-        const backend *b = next_backend(r);
+        const backend *b = &r->backends[(start + (unsigned int)tries) % (unsigned int)r->backend_count];
         int upfd = open_clientfd(b->host, b->port);
         if (upfd < 0) continue;
         // 경로는 바꾸지 않고 원래 URI(경로 + 쿼리)를 그대로 넘긴다 ("/api/x" → 백엔드의 "/api/x")

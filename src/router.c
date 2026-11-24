@@ -124,7 +124,12 @@ route *match_route(route_table *table, const char *path) {
 
 const backend *next_backend(route *r) {
     if (r == NULL || r->backend_count <= 0) return NULL;
+    return &r->backends[next_backend_index(r)];
+}
+
+unsigned int next_backend_index(route *r) {
+    if (r == NULL || r->backend_count <= 0) return 0;
     // 여러 워커가 동시에 부르므로 원자적 증가 (락 없이 카운터만 공유). 순서 보장만 필요해 RELAXED로 충분
     unsigned int n = __atomic_fetch_add(&r->next, 1, __ATOMIC_RELAXED);
-    return &r->backends[n % (unsigned int)r->backend_count];
+    return n % (unsigned int)r->backend_count;
 }

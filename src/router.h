@@ -38,4 +38,7 @@ route *match_route(route_table *table, const char *path);
 // Round-Robin으로 다음 백엔드 선택 (스레드 안전)
 const backend *next_backend(route *r);
 
+// Round-Robin으로 다음 시작 인덱스(0 ~ backend_count-1) 선택 (스레드 안전, failover 순회용)
+unsigned int next_backend_index(route *r);
+
 #endif
