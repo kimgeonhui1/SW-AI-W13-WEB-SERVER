@@ -147,7 +147,7 @@ nc -z 127.0.0.1 "$PORT"
 expect_eq "연결만 하고 바로 끊은 뒤" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")" "200"
 
 for _ in $(seq 30); do printf 'GET / HTTP/1.0\r\n\r\n' | timeout 0.05 nc 127.0.0.1 "$PORT" >/dev/null 2>&1; done
-expect_eq "응답 안 읽고 끊기 30회(SIGPIPE) 뒤" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")" "200"
+expect_eq "응답 안 읽고 끊기 30회 뒤" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")" "200"
 
 long=$(head -c 20000 /dev/zero | tr '\0' 'a')
 got=$(printf 'GET / HTTP/1.1\r\nX-Long: %s\r\n\r\n' "$long" | nc -q 1 127.0.0.1 "$PORT" | head -1 | tr -d '\r')
@@ -346,6 +346,25 @@ sleep 0.2
 expect_eq "시간 초과 CGI가 띄운 자식(sleep)까지 종료" "$(pgrep -fc 'sleep 31$')" "0"
 stop_server
 rm -rf "$CGID"
+
+# ───────────── 12-2. SIGPIPE ─────────────
+# 응답이 작으면 커널 송신 버퍼에 한 번에 들어가 SIGPIPE가 나지 않는다.
+# 20MB를 보내는 도중 클라이언트가 끊으면 서버의 다음 write가 EPIPE → SIGPIPE를 무시하지 않으면 서버가 죽는다
+echo "== 12-2. 큰 응답 도중 클라이언트가 끊음 (SIGPIPE)"
+SP=$(mktemp -d)
+head -c 20000000 /dev/zero > "$SP/big.bin"
+printf 'ok' > "$SP/index.html"
+start_server -r "$SP"
+# 요청을 보내자마자(응답이 오기 전에) 정상 종료(FIN)한다. 서버가 FIN을 받은 뒤 쓰면 상대가 RST로 답하고,
+# 그 다음 write가 EPIPE → SIGPIPE. (응답을 받은 채로 닫으면 RST가 먼저 가서 ECONNRESET이 되고 SIGPIPE는 안 난다)
+for _ in $(seq 10); do
+    ( exec 3<>"/dev/tcp/127.0.0.1/$PORT" && printf 'GET /big.bin HTTP/1.1\r\nHost: x\r\n\r\n' >&3 ) 2>/dev/null
+done
+sleep 0.3
+kill -0 "$PID" 2>/dev/null && ok "큰 응답 도중 끊겨도 서버 생존 (SIGPIPE 무시)" || bad "SIGPIPE" "서버 종료됨"
+expect_eq "그 뒤 요청도 정상" "$(curl -s --max-time 3 "http://127.0.0.1:$PORT/")" "ok"
+stop_server
+rm -rf "$SP"
 
 # ───────────── 13. Reverse Proxy ─────────────
 echo "== 13. Reverse Proxy"
