@@ -199,6 +199,11 @@ got=$({ printf 'GET / HTTP/1.1\r\nX-Slow: '; for _ in $(seq 14); do printf 'a'; 
       | nc -q 1 127.0.0.1 "$PORT" | head -1 | tr -d '\r')
 expect_eq "slowloris(1초에 1바이트) → 408" "$got" "HTTP/1.1 408 Request Timeout"
 
+# 요청 라인 자체를 4초에 1바이트씩 → 수신 타임아웃(5초)을 매번 피하므로 첫 바이트부터 재는 전체 제한(10초)에 걸려 408
+got=$({ for c in G E T ' ' /; do printf '%s' "$c"; sleep 4; done; } \
+      | nc -q 1 127.0.0.1 "$PORT" | head -1 | tr -d '\r')
+expect_eq "요청 라인을 천천히 보내는 slowloris → 408" "$got" "HTTP/1.1 408 Request Timeout"
+
 # ───────────── 7. 같은 포트 중복 실행 ─────────────
 echo "== 7. 포트 충돌"
 timeout 3 "$SERVER" -p "$PORT" >/dev/null 2>&1

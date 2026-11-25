@@ -24,6 +24,9 @@ ssize_t rio_writen(int fd, const void *buf, size_t n);
 // rp를 fd에 연결하고 내부 버퍼를 비운다
 void rio_readinitb(rio_t *rp, int fd);
 
+// 읽을 데이터가 1바이트 이상 생길 때까지 기다리되 꺼내지는 않는다. 데이터 있음 1, EOF 0, 실패·시간 초과 -1
+int rio_waitb(rio_t *rp);
+
 // '\n'까지 한 줄 읽기 (최대 maxlen-1바이트 + '\0'). 읽은 바이트 수, EOF면 0, 실패·maxlen<=1이면 -1
 ssize_t rio_readlineb(rio_t *rp, void *buf, size_t maxlen);
 

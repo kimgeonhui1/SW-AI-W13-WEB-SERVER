@@ -66,6 +66,12 @@ static ssize_t rio_read(rio_t *rp, char *usrbuf, size_t n) {
     return (ssize_t)cnt;
 }
 
+int rio_waitb(rio_t *rp) {
+    char c;
+    if (rio_read(rp, &c, 0) < 0) return -1;   // n = 0: 버퍼가 비었으면 채우기만 하고 아무것도 꺼내지 않음
+    return rp->cnt > 0 ? 1 : 0;
+}
+
 ssize_t rio_readlineb(rio_t *rp, void *buf, size_t maxlen) {
     char *p = buf;
     size_t n;

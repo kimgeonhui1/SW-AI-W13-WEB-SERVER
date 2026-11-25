@@ -291,12 +291,16 @@ int parse_header_line(const char *line, http_request *req) {
 static int read_request_inner(rio_t *rp, http_request *req) {
     memset(req, 0, sizeof(*req));
 
+    // 첫 바이트가 올 때까지는 keep-alive 유휴 대기 → 수신 타임아웃만 적용하고, EOF·시간 초과면 조용히 닫는다
+    if (rio_waitb(rp) <= 0) return -1;
+    // 요청 전체 시간 제한은 첫 바이트부터 잰다. 첫 줄을 받은 뒤부터 재면
+    // 요청 라인을 몇 초에 1바이트씩 보내는 클라이언트가 워커를 몇 시간씩 붙잡을 수 있다
+    rp->deadline = rio_now() + REQUEST_TIMEOUT_SEC;
+
     char line[MAX_LINE];
     ssize_t n = rio_readlineb(rp, line, sizeof(line));
     if (n < 0) return -1;
-    if (n == 0) return -1; // 정상 EOF(요청 시작 전 연결 종료)
-    // 시간 제한은 요청 라인의 첫 줄을 받은 뒤부터 잰다 (그 전의 대기는 keep-alive 유휴 시간 → 수신 타임아웃이 담당)
-    rp->deadline = rio_now() + REQUEST_TIMEOUT_SEC;
+    if (n == 0) return -1; // 데이터가 있었으므로 실제로는 오지 않음 — 방어용
     // 요청 라인이 버퍼보다 길어 잘림('\n' 없이 가득 참) → 잘린 줄은 버전이 빠져 400으로 오판되므로 414로 거부
     if (line[n - 1] != '\n' && (size_t)n == sizeof(line) - 1) return 414;
 

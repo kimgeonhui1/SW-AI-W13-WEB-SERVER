@@ -113,6 +113,24 @@ static void test_readnb_short_on_eof(void) {
     close(sv[1]);
 }
 
+// waitb: 데이터가 생길 때까지 기다리되 꺼내지 않음 → 이어서 읽으면 처음부터 그대로 나와야 함. EOF면 0
+static void test_waitb_does_not_consume(void) {
+    int sv[2];
+    make_pair(sv);
+    rio_writen(sv[0], "GET\n", 4);
+    close(sv[0]);
+
+    rio_t rio;
+    char line[16];
+    rio_readinitb(&rio, sv[1]);
+    CHECK(rio_waitb(&rio) == 1);
+    CHECK(rio_waitb(&rio) == 1);                            // 두 번 불러도 꺼내지 않음
+    CHECK(rio_readlineb(&rio, line, sizeof(line)) == 4);
+    CHECK(strcmp(line, "GET\n") == 0);
+    CHECK(rio_waitb(&rio) == 0);                            // 다 읽은 뒤 EOF
+    close(sv[1]);
+}
+
 // 소켓 버퍼보다 큰 데이터를 rio_writen으로 보내면 write가 여러 번 나뉘어도 전부 도착해야 함
 #define BIG (512 * 1024)
 static char big_out[BIG], big_in[BIG];
@@ -946,5 +964,6 @@ int main(void) {
     test_wrong_direction_fds();
     test_read_after_timeout_recovers();
     test_writen_1mb();
+    test_waitb_does_not_consume();
     return TEST_RESULT();
 }
