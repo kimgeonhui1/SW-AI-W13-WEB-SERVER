@@ -10,6 +10,8 @@ POSIX 소켓 API만으로 만든 C 웹서버 (WEEK13 · 11팀)
 
 ## 1. 구조와 설계 선택
 
+### 1-0. 전체 흐름
+
 ```mermaid
 flowchart TD
     A["P1 · main.c: 인자 파싱 + 시그널 설정"] --> B["P1 · server.c: run_server()"]
@@ -48,16 +50,91 @@ flowchart TD
     class G,ERR,S stop
 ```
 
+아래에서 이 그림을 네 부분으로 나눠 확대해 봅니다.
+
+### 1-1. 서버 시작과 연결 받기 (메인 스레드)
+
+```mermaid
+flowchart LR
+    A["① open_listenfd()<br/>socket → bind → listen"] --> B["② 워커 8개 생성<br/>큐 앞에서 잠듦"]
+    B --> C["③ pselect<br/>연결 기다림"]
+    C --> D["accept → fd"]
+    D --> Q{"④ 워커 · 큐 상태"}
+    Q -- "노는 워커 있음" --> W["큐에 넣고<br/>워커 깨움"]
+    Q -- "워커 모두 바쁨<br/>큐에 자리 있음" --> WQ["큐에서 대기"]
+    Q -- "워커 모두 바쁨<br/>큐 가득 참" --> X["즉시 503"]
+    classDef main fill:#e8f0fe,stroke:#4c7bd9,color:#1b2b4b
+    classDef stop fill:#fdecec,stroke:#d0504f,color:#4b1414
+    class A,B,C,D,W,WQ main
+    class X stop
+```
+
 | 순서 | 어디서 | 무엇을 | 왜 이렇게 |
 |---|---|---|---|
 | ① | `run_server` → `net.c` `open_listenfd()` | `socket` → `bind`(주소·포트) → `listen`. 이후 커널이 연결을 완성해 **커널 대기 큐**에 쌓음 | |
 | ② | `threadpool.c` | **워커 스레드 8개를 미리 생성** (`-t`로 조절). 워커는 클라이언트와 HTTP 요청·응답을 주고받고, 처리할 연결이 없으면 큐 앞에서 잠듦 | 요청마다 스레드를 만들면 생성 비용이 들고, 몰리면 스레드가 끝없이 늘어나 서버가 죽을 수 있음 |
 | ③ | 메인 스레드 | `pselect`로 기다림 → `accept` → 큐에 넣고 워커 하나 깨움 → 다음 연결 대기 | 직접 처리하면 그동안 새 연결을 받을 수 없음 |
 | ④ | 큐 | 워커가 모두 바쁘고 큐에 자리가 있으면 **큐에서 대기**, 큐까지 가득 차면 **즉시 503** | 몰려도 서버가 멈추지 않게 |
+
+### 1-2. 연결 하나 처리하기 (워커 · `handle_connection`)
+
+```mermaid
+flowchart TD
+    S["⑤ 8KB 읽기 버퍼 · 수신 5초 · 송신 10초"] --> R["read_request<br/>요청 줄 · 헤더 · 본문"]
+    R -- "0 성공" --> K["keep 결정"]
+    K --> D["dispatch → 처리 → HTTP 응답<br/>(1-3, 1-4)"]
+    D --> J{"⑧ 계속할까?<br/>keep 이고 hr ≥ 0"}
+    J -- "예 · 같은 연결" --> R
+    J -- "아니오" --> C["남은 데이터 읽어 버린 뒤 끊기<br/>lingering_close"]
+    R -- "양수: 파싱 오류" --> E["reply_error"]
+    E --> C
+    R -- "-1: 끊김 · 유휴" --> C
+    classDef work fill:#e9f7ef,stroke:#3a9d63,color:#173a26
+    classDef stop fill:#fdecec,stroke:#d0504f,color:#4b1414
+    class S,R,K,D work
+    class E,C stop
+```
+
+| 순서 | 어디서 | 무엇을 | 왜 이렇게 |
+|---|---|---|---|
 | ⑤ | `handle_connection` | 8KB 읽기 버퍼 준비 → **수신 5초 · 송신 10초** 제한 → `read_request`로 요청 줄·헤더·본문 읽고 검사 | 보내지 않거나 받아 가지 않는 클라이언트에 워커가 묶이지 않게 |
 | ⑥ | 모든 처리 함수 | 리턴값 통일: **`0` 성공 · 양수 = 보낼 HTTP 오류 코드 · `-1` 연결 끊기** | 오류 응답을 `handle_connection` 한 곳에서만 보냄 |
-| ⑦ | `dispatch` | 절대 URL → Forward / 설정 경로 → Reverse / `cgi-bin` → CGI / 그 외 → 정적 파일. **CGI 출력은 파이프로 서버가 먼저 받음** | 서버가 확인하고 `Content-Length`를 붙여야 연결을 이어 쓸 수 있고, 이상한 출력을 502로 막을 수 있음 |
 | ⑧ | 응답 뒤 | keep-alive면 같은 연결로 다음 요청, 아니면 **남은 데이터를 읽어 버린 뒤** 연결 끊기 | 읽지 않은 데이터가 남은 채로 끊으면 커널이 강제 종료(RST)를 보내 클라이언트가 방금 받은 HTTP 응답까지 버릴 수 있음 |
+
+### 1-3. 분기 ⑦ — CGI (`cgi.c`)
+
+```mermaid
+flowchart LR
+    W["워커<br/>fork 전에 환경변수 준비"] -- "fork + execve" --> P["CGI 프로세스<br/>(adder 등)"]
+    W -- "POST 본문 → stdin 파이프" --> P
+    P -- "출력 → stdout 파이프" --> G["워커가 출력 수집<br/>poll로 입출력 동시 · 5초 · 1MB"]
+    G --> H["헤더 검사 + Content-Length<br/>→ HTTP 응답"]
+    G -. "5초 초과" .-> T["프로세스 그룹 SIGKILL → 504"]
+    classDef work fill:#e9f7ef,stroke:#3a9d63,color:#173a26
+    classDef handler fill:#fff4e5,stroke:#d18a1f,color:#4a3007
+    classDef stop fill:#fdecec,stroke:#d0504f,color:#4b1414
+    class W,G,H work
+    class P handler
+    class T stop
+```
+
+| 순서 | 어디서 | 무엇을 | 왜 이렇게 |
+|---|---|---|---|
+| ⑦ | `dispatch` | 절대 URL → Forward / 설정 경로 → Reverse / `cgi-bin` → CGI / 그 외 → 정적 파일. **CGI 출력은 파이프로 서버가 먼저 받음** | 서버가 확인하고 `Content-Length`를 붙여야 연결을 이어 쓸 수 있고, 이상한 출력을 502로 막을 수 있음 |
+
+### 1-4. 분기 ⑦ — Reverse · Forward Proxy (`proxy_relay`)
+
+```mermaid
+flowchart LR
+    C["클라이언트 요청"] --> PX["proxy_relay<br/>hop-by-hop 헤더 제거 · Connection: close"]
+    PX -- "Reverse: 최장 prefix · Round-Robin<br/>꺼진 백엔드는 건너뜀" --> B["백엔드 1 / 2"]
+    PX -- "Forward (-f): URL에서 host · port<br/>Host 재작성" --> O["원 서버"]
+    B --> V["응답 검사<br/>깨진 상태 줄 · TE+CL · 제어 문자 → 502<br/>connect · 헤더 5초 초과 → 504"]
+    O --> V
+    V --> OUT["클라이언트로 바로 전달 (스트리밍)"]
+    classDef proxy fill:#f3eafd,stroke:#8a5cd1,color:#2f1b4b
+    class PX,B,O,V,OUT proxy
+```
 
 ---
 
