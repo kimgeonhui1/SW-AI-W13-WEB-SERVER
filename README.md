@@ -16,62 +16,23 @@
 
 ### 1-0. 전체 흐름
 
-```mermaid
-flowchart TD
-    A["P1 · main.c: 인자 파싱 + 시그널 설정"] --> B["P1 · server.c: run_server()"]
-    B --> C["1. net.c: open_listenfd()"]
-    C --> D["2. threadpool.c: 워커 N개 생성"]
-    D --> E["3. pselect + accept 루프 (메인 스레드)"]
-    E -- "큐 여유 있음" --> F["threadpool_submit(connfd)"]
-    E -- "큐 가득 참" --> G["reject_busy() → 503 후 close"]
-    F --> H["P2 · 워커: handle_connection(connfd)<br/>소켓 설정 (연결당 1번)"]
-    H --> I["P2 · read_request() (rio.c 사용)"]
-    I -- "파싱 오류 (반환값 > 0)" --> ERR["reply_error()"]
-    ERR --> S["P6 · lingering_close(connfd)"]
-    I -- "끊김 · 유휴 초과 (반환값 -1)" --> S
-    I -- "성공 (반환값 0)" --> J["P3 · dispatch() 요청 분기<br/>(직전에 keep 결정)"]
-    J -- "http://... (절대 URI)" --> K["P5 · forward_proxy.c (-f 없으면 403)"]
-    J -- "routes.conf 매칭" --> L["P5 · router.c + proxy.c (Reverse Proxy)"]
-    J -- "/cgi-bin/..." --> M["P4 · cgi.c (fork + execve)"]
-    J -- "그 외" --> N["P3 · static_file.c + mime.c (정적 파일)"]
-    K --> P["P5 · proxy.c: proxy_relay()"]
-    L --> P
-    M --> Q["http_response.c: send_headers / send_response"]
-    N --> Q
-    P --> R["P6 · 계속할지 판단<br/>(keep · 반환값 hr)"]
-    Q --> R
-    R -- "keep-alive 유지 (다음 요청)" --> I
-    R -- "keep-alive가 아니거나 오류인 경우" --> S
-    classDef entry fill:#e8f0fe,stroke:#4c7bd9,color:#1b2b4b
-    classDef io fill:#e9f7ef,stroke:#3a9d63,color:#173a26
-    classDef handler fill:#fff4e5,stroke:#d18a1f,color:#4a3007
-    classDef proxy fill:#f3eafd,stroke:#8a5cd1,color:#2f1b4b
-    classDef stop fill:#fdecec,stroke:#d0504f,color:#4b1414
-    class A,B,C,D,E,F entry
-    class H,I,J,R io
-    class M,N,Q handler
-    class K,L,P proxy
-    class G,ERR,S stop
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/flow-full-dark.svg">
+    <img alt="전체 흐름: 메인 스레드가 연결을 받아 큐에 넣고, 워커가 handle_connection 안에서 읽기 · 분기 · 응답 · 계속 여부 판단을 반복" src="docs/img/flow-full-light.svg" width="900">
+  </picture>
+</p>
 
 아래에서 이 그림을 네 부분으로 나눠 확대해 봅니다.
 
 ### 1-1. 서버 시작과 연결 받기 (메인 스레드)
 
-```mermaid
-flowchart LR
-    A["① open_listenfd()<br/>socket → bind → listen"] --> B["② 워커 8개 생성<br/>큐 앞에서 잠듦"]
-    B --> C["③ pselect<br/>연결 기다림"]
-    C --> D["accept → fd"]
-    D --> Q{"④ 워커 · 큐 상태"}
-    Q -- "노는 워커 있음" --> W["큐에 넣고<br/>워커 깨움"]
-    Q -- "워커 모두 바쁨<br/>큐에 자리 있음" --> WQ["큐에서 대기"]
-    Q -- "워커 모두 바쁨<br/>큐 가득 참" --> X["즉시 503"]
-    classDef main fill:#e8f0fe,stroke:#4c7bd9,color:#1b2b4b
-    classDef stop fill:#fdecec,stroke:#d0504f,color:#4b1414
-    class A,B,C,D,W,WQ main
-    class X stop
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/flow-main-dark.svg">
+    <img alt="메인 스레드: open_listenfd, 워커 생성, pselect + accept, 큐에 넣기 또는 503" src="docs/img/flow-main-light.svg" width="900">
+  </picture>
+</p>
 
 | 순서 | 어디서 | 무엇을 | 왜 이렇게 |
 |---|---|---|---|
@@ -82,22 +43,12 @@ flowchart LR
 
 ### 1-2. 연결 하나 처리하기 (워커 · `handle_connection`)
 
-```mermaid
-flowchart TD
-    S["⑤ 8KB 읽기 버퍼 · 수신 5초 · 송신 10초"] --> R["read_request<br/>요청 줄 · 헤더 · 본문"]
-    R -- "0 성공" --> K["keep 결정"]
-    K --> D["dispatch → 처리 → HTTP 응답<br/>(1-3, 1-4)"]
-    D --> J{"⑧ 계속할까?<br/>keep 이고 hr ≥ 0"}
-    J -- "예 · 같은 연결" --> R
-    J -- "아니오" --> C["남은 데이터 읽어 버린 뒤 끊기<br/>lingering_close"]
-    R -- "양수: 파싱 오류" --> E["reply_error"]
-    E --> C
-    R -- "-1: 끊김 · 유휴" --> C
-    classDef work fill:#e9f7ef,stroke:#3a9d63,color:#173a26
-    classDef stop fill:#fdecec,stroke:#d0504f,color:#4b1414
-    class S,R,K,D work
-    class E,C stop
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/flow-worker-dark.svg">
+    <img alt="워커: handle_connection, read_request, dispatch, 계속할지 판단, lingering_close" src="docs/img/flow-worker-light.svg" width="900">
+  </picture>
+</p>
 
 | 순서 | 어디서 | 무엇을 | 왜 이렇게 |
 |---|---|---|---|
@@ -107,20 +58,12 @@ flowchart TD
 
 ### 1-3. 분기 ⑦ — CGI (`cgi.c`)
 
-```mermaid
-flowchart LR
-    W["워커<br/>fork 전에 환경변수 준비"] -- "fork + execve" --> P["CGI 프로세스<br/>(adder 등)"]
-    W -- "POST 본문 → stdin 파이프" --> P
-    P -- "출력 → stdout 파이프" --> G["워커가 출력 수집<br/>poll로 입출력 동시 · 5초 · 1MB"]
-    G --> H["헤더 검사 + Content-Length<br/>→ HTTP 응답"]
-    G -. "5초 초과" .-> T["프로세스 그룹 SIGKILL → 504"]
-    classDef work fill:#e9f7ef,stroke:#3a9d63,color:#173a26
-    classDef handler fill:#fff4e5,stroke:#d18a1f,color:#4a3007
-    classDef stop fill:#fdecec,stroke:#d0504f,color:#4b1414
-    class W,G,H work
-    class P handler
-    class T stop
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/flow-cgi-dark.svg">
+    <img alt="CGI: fork + execve, stdin/stdout 파이프, poll로 수집, 헤더 검사 후 응답, 시간 초과 504" src="docs/img/flow-cgi-light.svg" width="900">
+  </picture>
+</p>
 
 | 순서 | 어디서 | 무엇을 | 왜 이렇게 |
 |---|---|---|---|
@@ -128,17 +71,12 @@ flowchart LR
 
 ### 1-4. 분기 ⑦ — Reverse · Forward Proxy (`proxy_relay`)
 
-```mermaid
-flowchart LR
-    C["클라이언트 요청"] --> PX["proxy_relay<br/>hop-by-hop 헤더 제거 · Connection: close"]
-    PX -- "Reverse: 최장 prefix · Round-Robin<br/>꺼진 백엔드는 건너뜀" --> B["백엔드 1 / 2"]
-    PX -- "Forward (-f): URL에서 host · port<br/>Host 재작성" --> O["원 서버"]
-    B --> V["응답 검사<br/>깨진 상태 줄 · TE+CL · 제어 문자 → 502<br/>connect · 헤더 5초 초과 → 504"]
-    O --> V
-    V --> OUT["클라이언트로 바로 전달 (스트리밍)"]
-    classDef proxy fill:#f3eafd,stroke:#8a5cd1,color:#2f1b4b
-    class PX,B,O,V,OUT proxy
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/flow-proxy-dark.svg">
+    <img alt="프록시: proxy_relay가 Reverse는 백엔드로, Forward는 원 서버로 중계하고 응답 검사" src="docs/img/flow-proxy-light.svg" width="900">
+  </picture>
+</p>
 
 | 순서 | 어디서 | 무엇을 | 왜 이렇게 |
 |---|---|---|---|

@@ -188,6 +188,170 @@ const charts = {
   mutation,
 };
 
+// ───────────── 구조도 (노드 · 화살표) ─────────────
+// 역할별 왼쪽 띠 색: 메인 = 파랑, 워커 루프 = 회색, 프록시 = 보라, CGI·정적 = 청록, 오류·종료 = 빨강
+const ROLE = {
+  light: { main: '#2a78d6', worker: '#898781', proxy: '#6250d6', handler: '#1baf7a', err: '#d03b3b', panel: '#f3f3f0' },
+  dark:  { main: '#3987e5', worker: '#898781', proxy: '#9085e9', handler: '#199e70', err: '#d03b3b', panel: '#20201f' },
+};
+const MODE_OF = (t) => (t === THEMES.light ? 'light' : 'dark');
+
+function node(t, n, dim) {
+  const r = ROLE[MODE_OF(t)];
+  const op = dim ? ' opacity="0.32"' : '';
+  return `<g${op}><rect x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="8" fill="${t.surface}" stroke="${t.border}"/>` +
+    `<rect x="${n.x}" y="${n.y}" width="4" height="${n.h}" rx="2" fill="${r[n.role]}"/>` +
+    `<text x="${n.x + 14}" y="${n.y + (n.sub ? 20 : n.h / 2 + 4.5)}" font-size="13" font-weight="600" fill="${t.p}">${esc(n.title)}</text>` +
+    (n.sub ? `<text x="${n.x + 14}" y="${n.y + 37}" font-size="11.5" fill="${t.s}">${esc(n.sub)}</text>` : '') + '</g>';
+}
+function edge(t, e, dim) {
+  const op = dim ? ' opacity="0.32"' : '';
+  const d = 'M' + e.pts.map((p) => p.join(',')).join(' L');
+  let out = `<g${op}><path d="${d}" fill="none" stroke="${t.m}" stroke-width="1.5" stroke-linejoin="round"${e.noArrow ? '' : ' marker-end="url(#ah)"'}/>`;
+  if (e.label) {
+    const [lx, ly] = e.at, anchor = e.anchor || 'middle', tw = textWidth(e.label, 11.5);
+    const rx = anchor === 'middle' ? lx - tw / 2 - 4 : anchor === 'end' ? lx - tw - 4 : lx - 4;
+    out += `<rect x="${rx}" y="${ly - 12}" width="${tw + 8}" height="17" rx="3" fill="${e.bg || t.surface}"/>`;
+    out += `<text x="${lx}" y="${ly}" font-size="11.5" fill="${t.s}" text-anchor="${anchor}">${esc(e.label)}</text>`;
+  }
+  return out + '</g>';
+}
+const ARROW = (t) => `<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="${t.m}"/></marker></defs>`;
+
+// 전체 흐름: 위 = 메인 스레드, 아래 = 워커 스레드 (handle_connection 한 함수 안)
+const FLOW = {
+  panels: [
+    { x: 16, y: 60, w: 868, h: 164, label: '메인 스레드 · 1개 — 연결을 받아 큐에 넣기만 함' },
+    { x: 16, y: 240, w: 868, h: 500, label: '워커 스레드 · N개 — handle_connection(connfd) 한 함수 안에서 반복' },
+  ],
+  nodes: [
+    { id: 'main', x: 32, y: 94, w: 120, h: 46, role: 'main', title: 'main.c', sub: '인자 · 시그널' },
+    { id: 'run', x: 172, y: 94, w: 120, h: 46, role: 'main', title: 'run_server()', sub: 'server.c' },
+    { id: 'listen', x: 312, y: 94, w: 150, h: 46, role: 'main', title: '① open_listenfd()', sub: 'socket → bind → listen' },
+    { id: 'pool', x: 482, y: 94, w: 160, h: 46, role: 'main', title: '② 워커 N개 생성', sub: '큐 앞에서 잠들어 대기' },
+    { id: 'accept', x: 662, y: 94, w: 206, h: 46, role: 'main', title: '③ pselect + accept', sub: '연결을 받아 fd 하나' },
+    { id: 'submit', x: 604, y: 170, w: 152, h: 42, role: 'main', title: '큐에 넣고 깨움', sub: 'threadpool_submit' },
+    { id: 'busy', x: 772, y: 170, w: 96, h: 42, role: 'err', title: '즉시 503', sub: 'reject_busy' },
+    { id: 'hc', x: 420, y: 276, w: 216, h: 46, role: 'worker', title: 'handle_connection(fd)', sub: '⑤ 버퍼 8KB · 수신 5초 · 송신 10초' },
+    { id: 'read', x: 420, y: 356, w: 216, h: 46, role: 'worker', title: 'read_request()', sub: 'rio.c · ⑥ 리턴값 0 / 양수 / -1' },
+    { id: 'rerr', x: 32, y: 356, w: 150, h: 46, role: 'err', title: 'reply_error()', sub: '오류 응답 · keep = 0' },
+    { id: 'disp', x: 420, y: 446, w: 216, h: 46, role: 'worker', title: '⑦ dispatch()', sub: '직전에 keep 결정 · 4갈래 분기' },
+    { id: 'fwd', x: 210, y: 522, w: 150, h: 50, role: 'proxy', title: 'Forward Proxy', sub: 'http://… 절대 URL · -f' },
+    { id: 'rev', x: 372, y: 522, w: 150, h: 50, role: 'proxy', title: 'Reverse Proxy', sub: 'routes.conf 경로' },
+    { id: 'cgi', x: 534, y: 522, w: 150, h: 50, role: 'handler', title: 'CGI', sub: '/cgi-bin/ · fork + execve' },
+    { id: 'st', x: 696, y: 522, w: 150, h: 50, role: 'handler', title: '정적 파일', sub: '그 외 · 작은 파일 캐시' },
+    { id: 'relay', x: 276, y: 598, w: 180, h: 42, role: 'proxy', title: 'proxy_relay()', sub: '응답 검사 · 502 / 504' },
+    { id: 'resp', x: 592, y: 598, w: 196, h: 42, role: 'handler', title: 'send_headers / response', sub: 'Content-Length 붙여 응답' },
+    { id: 'dec', x: 420, y: 676, w: 216, h: 46, role: 'worker', title: '⑧ 계속할지 판단', sub: 'keep · 리턴값 hr' },
+    { id: 'close', x: 32, y: 676, w: 150, h: 46, role: 'err', title: 'lingering_close()', sub: '남은 입력 비우고 끊기' },
+  ],
+  edges: [
+    { pts: [[152, 117], [172, 117]] }, { pts: [[292, 117], [312, 117]] }, { pts: [[462, 117], [482, 117]] }, { pts: [[642, 117], [662, 117]] },
+    { pts: [[680, 140], [680, 170]], label: '④ 큐 여유', at: [686, 160], anchor: 'start', bg: 'panel' },
+    { pts: [[820, 140], [820, 170]], label: '가득', at: [826, 160], anchor: 'start', bg: 'panel' },
+    { pts: [[680, 212], [680, 256], [528, 256], [528, 276]], label: '워커가 큐에서 꺼냄', at: [690, 252], anchor: 'start', bg: 'panel' },
+    { pts: [[528, 322], [528, 356]] },
+    { pts: [[420, 379], [182, 379]], label: '파싱 오류 (리턴값 > 0)', at: [301, 374], bg: 'panel' },
+    { pts: [[80, 402], [80, 676]] },
+    { pts: [[450, 402], [450, 420], [150, 420], [150, 676]], label: '끊김 · 유휴 초과 (-1)', at: [300, 438], bg: 'panel' },
+    { pts: [[528, 402], [528, 446]], label: '성공 (0)', at: [536, 430], anchor: 'start', bg: 'panel' },
+    { pts: [[528, 492], [528, 506]], noArrow: true }, { pts: [[285, 506], [771, 506]], noArrow: true },
+    { pts: [[285, 506], [285, 522]] }, { pts: [[447, 506], [447, 522]] }, { pts: [[609, 506], [609, 522]] }, { pts: [[771, 506], [771, 522]] },
+    { id: 'pr1', pts: [[285, 572], [285, 586], [447, 586]], noArrow: true }, { id: 'pr2', pts: [[447, 572], [447, 586]], noArrow: true },
+    { id: 'pr3', pts: [[366, 586], [366, 598]] },
+    { id: 'rs1', pts: [[609, 572], [609, 586], [771, 586]], noArrow: true }, { id: 'rs2', pts: [[771, 572], [771, 586]], noArrow: true },
+    { id: 'rs3', pts: [[690, 586], [690, 598]] },
+    { pts: [[366, 640], [366, 656], [500, 656], [500, 676]] }, { pts: [[690, 640], [690, 656], [556, 656], [556, 676]] },
+    { pts: [[420, 699], [182, 699]], label: 'keep-alive가 아니거나 오류', at: [301, 693], bg: 'panel' },
+    { pts: [[636, 699], [866, 699], [866, 379], [636, 379]], label: 'keep-alive 유지 · 다음 요청', at: [760, 374], bg: 'panel' },
+  ],
+};
+const HANDLER_IDS = new Set(['fwd', 'rev', 'cgi', 'st', 'relay', 'resp']);
+
+function flow(t, { title, sub, clip, dimHandlers = false }) {
+  const [cx, cy, cw, ch] = clip, head = 70;
+  const r = ROLE[MODE_OF(t)];
+  let g = '';
+  for (const p of FLOW.panels) {
+    g += `<rect x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" rx="10" fill="${r.panel}" stroke="${t.border}"/>`;
+    g += `<text x="${p.x + 14}" y="${p.y + 22}" font-size="12" font-weight="600" fill="${t.s}">${esc(p.label)}</text>`;
+  }
+  for (const e of FLOW.edges) {
+    const dim = dimHandlers && (e.id || (e.pts[0][1] >= 506 && e.pts[0][1] < 676 && !e.label));
+    g += edge(t, { ...e, bg: e.bg === 'panel' ? r.panel : e.bg }, dim);
+  }
+  for (const n of FLOW.nodes) g += node(t, n, dimHandlers && HANDLER_IDS.has(n.id));
+  const W = cw, H = ch + head;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="${FONT}" role="img" aria-label="${esc(title)}">
+${ARROW(t)}
+<rect x="0.5" y="0.5" width="${W - 1}" height="${H - 1}" rx="12" fill="${t.surface}" stroke="${t.border}"/>
+<text x="24" y="36" font-size="16" font-weight="600" fill="${t.p}">${esc(title)}</text>
+<text x="24" y="57" font-size="12.5" fill="${t.s}">${esc(sub)}</text>
+<svg x="0" y="${head}" width="${cw}" height="${ch}" viewBox="${cx} ${cy} ${cw} ${ch}">${g}</svg>
+</svg>\n`;
+}
+
+// 간단한 노드·화살표 그림 (CGI, 프록시)
+function simple(t, { title, sub, W, H, nodes, edges }) {
+  let g = '';
+  for (const e of edges) g += edge(t, e, false);
+  for (const n of nodes) g += node(t, n, false);
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="${FONT}" role="img" aria-label="${esc(title)}">
+${ARROW(t)}
+<rect x="0.5" y="0.5" width="${W - 1}" height="${H - 1}" rx="12" fill="${t.surface}" stroke="${t.border}"/>
+<text x="24" y="36" font-size="16" font-weight="600" fill="${t.p}">${esc(title)}</text>
+<text x="24" y="57" font-size="12.5" fill="${t.s}">${esc(sub)}</text>
+${g}
+</svg>\n`;
+}
+
+const CGI_FIG = {
+  title: 'CGI 실행 — 출력을 파이프로 먼저 받아서 응답', sub: 'cgi.c · 자식은 execve 전까지 async-signal-safe 함수만 사용', W: 900, H: 320,
+  nodes: [
+    { x: 24, y: 104, w: 190, h: 52, role: 'worker', title: '워커', sub: 'fork 전에 환경변수 준비' },
+    { x: 320, y: 104, w: 200, h: 52, role: 'handler', title: 'CGI 프로세스 (adder 등)', sub: '자기 프로세스 그룹' },
+    { x: 660, y: 104, w: 216, h: 52, role: 'worker', title: '워커가 출력 수집', sub: 'poll로 입출력 동시 · 5초 · 1MB' },
+    { x: 660, y: 240, w: 216, h: 52, role: 'handler', title: '헤더 검사 + Content-Length', sub: '→ HTTP 응답 · 연결 유지 가능' },
+    { x: 320, y: 240, w: 200, h: 52, role: 'err', title: '504 / 502', sub: '그룹 SIGKILL · waitpid 회수' },
+  ],
+  edges: [
+    { pts: [[214, 118], [320, 118]], label: 'fork + execve', at: [267, 112] },
+    { pts: [[214, 142], [320, 142]], label: 'POST 본문 → stdin', at: [267, 166] },
+    { pts: [[520, 130], [660, 130]], label: '출력 → stdout', at: [590, 124] },
+    { pts: [[768, 156], [768, 240]], label: '정상', at: [776, 202], anchor: 'start' },
+    { pts: [[708, 156], [708, 196], [420, 196], [420, 240]], label: '5초 초과 · 1MB 초과 · 형식 오류', at: [564, 190] },
+  ],
+};
+
+const PROXY_FIG = {
+  title: 'Reverse · Forward Proxy — 같은 proxy_relay로 중계', sub: '다른 점은 어디로 접속할지를 누가 정하는가 (운영자의 routes.conf / 클라이언트의 URL)', W: 900, H: 380,
+  nodes: [
+    { x: 24, y: 150, w: 150, h: 52, role: 'worker', title: '클라이언트 요청', sub: 'dispatch에서 분기' },
+    { x: 204, y: 150, w: 236, h: 52, role: 'proxy', title: 'proxy_relay()', sub: 'hop-by-hop 제거 · Connection: close' },
+    { x: 476, y: 90, w: 210, h: 52, role: 'proxy', title: 'Reverse (-c routes.conf)', sub: '최장 prefix · Round-Robin' },
+    { x: 476, y: 210, w: 210, h: 52, role: 'proxy', title: 'Forward (-f)', sub: 'URL에서 host · port · Host 재작성' },
+    { x: 716, y: 90, w: 160, h: 52, role: 'handler', title: '백엔드 1 / 2', sub: '꺼진 백엔드는 건너뜀' },
+    { x: 716, y: 210, w: 160, h: 52, role: 'handler', title: '원 서버', sub: 'connect 5초 제한' },
+    { x: 476, y: 306, w: 210, h: 52, role: 'proxy', title: '응답 검사', sub: '깨진 응답 502 · 5초 초과 504' },
+    { x: 204, y: 306, w: 236, h: 52, role: 'worker', title: '클라이언트로 전달', sub: '받는 즉시 스트리밍' },
+  ],
+  edges: [
+    { pts: [[174, 176], [204, 176]] },
+    { pts: [[440, 166], [458, 166], [458, 116], [476, 116]] },
+    { pts: [[440, 186], [458, 186], [458, 236], [476, 236]] },
+    { pts: [[686, 116], [716, 116]] }, { pts: [[686, 236], [716, 236]] },
+    { pts: [[876, 116], [890, 116], [890, 332], [686, 332]] },
+    { pts: [[796, 262], [796, 332]], noArrow: true },
+    { pts: [[476, 332], [440, 332]] },
+  ],
+};
+
+charts['flow-full'] = (t) => flow(t, { title: '전체 흐름', sub: '서버 시작부터 연결을 닫을 때까지 · 번호는 아래 표의 ①~⑧', clip: [0, 50, 900, 700] });
+charts['flow-main'] = (t) => flow(t, { title: '1-1. 서버 시작과 연결 받기', sub: '메인 스레드 부분 확대', clip: [0, 52, 900, 180] });
+charts['flow-worker'] = (t) => flow(t, { title: '1-2. 연결 하나 처리하기', sub: '워커 스레드 부분 확대 · 4갈래 처리는 1-3, 1-4에서', clip: [0, 232, 900, 516], dimHandlers: true });
+charts['flow-cgi'] = (t) => simple(t, CGI_FIG);
+charts['flow-proxy'] = (t) => simple(t, PROXY_FIG);
+
 for (const [name, fn] of Object.entries(charts)) {
   for (const mode of ['light', 'dark']) writeFileSync(join(OUT, `${name}-${mode}.svg`), fn(THEMES[mode]));
 }
