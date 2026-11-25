@@ -1,11 +1,11 @@
 # SW-AI-W13-WEB-SERVER
 
-POSIX 소켓 API만으로 만든 C 웹서버 (WEEK13 · 11팀)
-정적 파일 · CGI · 스레드 풀 · Reverse Proxy · Forward Proxy
-
-| 기능 테스트 | 단위 테스트 | 메모리 | 변이 테스트 | 정적 파일 처리량 |
-|:---:|:---:|:---:|:---:|:---:|
-| **145 / 145** | **약 730개 통과** | **오류 0 · 누수 0** | **61 / 63 검출** | **초당 92,750건** |
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/hero-dark.svg">
+    <img alt="기능 테스트 145/145 · 단위 검사 732 · 메모리 오류 0 · 변이 61/63 · 초당 92,750건" src="docs/img/hero-light.svg" width="880">
+  </picture>
+</p>
 
 **발표 순서**: [1. 구조와 설계 선택](#1-구조와-설계-선택) → [2. 검증](#2-검증) → [3. 회고](#3-회고)
 파트별 상세 설명과 테스트 목록은 [상세 문서](#상세-문서)에 있습니다.
@@ -162,32 +162,30 @@ flowchart LR
 
 ### 2-1. 테스트를 어디에 얼마나 했나
 
-```mermaid
-xychart-beta
-    title "기능 테스트 145개 — 영역별 (실제 서버를 띄워 curl · nc로 확인)"
-    x-axis ["시작·인자", "동시성·큐", "요청 읽기", "응답·CGI", "프록시", "종료·자원"]
-    y-axis "테스트 수" 0 --> 50
-    bar [42, 16, 10, 35, 24, 18]
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/tests-by-area-dark.svg">
+    <img alt="기능 테스트 145개 영역별 막대 그래프" src="docs/img/tests-by-area-light.svg" width="760">
+  </picture>
+</p>
 
-```mermaid
-xychart-beta horizontal
-    title "단위 테스트 검사 732개 — 파일별"
-    x-axis ["rio", "proxy", "static", "request", "router", "net", "cgi", "forward", "server", "pool", "mime"]
-    y-axis "검사 수" 0 --> 160
-    bar [156, 81, 80, 73, 66, 58, 53, 53, 51, 32, 29]
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/unit-by-file-dark.svg">
+    <img alt="단위 테스트 검사 732개 파일별 막대 그래프" src="docs/img/unit-by-file-light.svg" width="760">
+  </picture>
+</p>
 
 ### 2-2. 테스트가 버그를 잡는지도 검증 (변이 테스트)
 
 코드에 일부러 버그를 넣었을 때(검사 한 줄 삭제, 조건 뒤집기, 원자 연산 제거 …) 테스트가 실패하는지 확인했습니다.
 
-```mermaid
-pie showData
-    title 변이 63개 결과
-    "테스트가 잡음" : 61
-    "등가 변이 (지워도 동작이 같음)" : 2
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/mutation-dark.svg">
+    <img alt="변이 테스트 63개 중 61개 검출" src="docs/img/mutation-light.svg" width="760">
+  </picture>
+</p>
 
 | 영역 | 변이 수 | 검출 | 놓친 것 |
 |---|:---:|:---:|---|
@@ -212,16 +210,14 @@ pie showData
 
 ### 2-4. 성능 (wrk, 10초, keep-alive, 워커 8개)
 
-```mermaid
-xychart-beta
-    title "정적 파일 처리량 — 동시 연결 수별 (초당 요청 수)"
-    x-axis ["10연결", "100연결", "500연결"]
-    y-axis "초당 요청" 0 --> 100000
-    bar [92750, 41368, 37024]
-    line [3120, 3211, 3166]
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/perf-concurrency-dark.svg">
+    <img alt="동시 연결 수별 정적 파일 처리량" src="docs/img/perf-concurrency-light.svg" width="760">
+  </picture>
+</p>
 
-막대 = 작은 파일 캐시 적용 후 · 선 = 적용 전. 동시 연결이 늘면 연결 하나가 기다리는 시간이 늘어 처리량이 줄지만, **동시 500연결에서도 503 · 소켓 오류 0건**입니다.
+동시 연결이 늘면 연결 하나가 기다리는 시간이 늘어 처리량이 줄지만, **동시 500연결에서도 503 · 소켓 오류 0건**입니다.
 
 | 동시 연결 | 초당 요청 | 평균 지연 |
 |:---:|:---:|:---:|
@@ -229,25 +225,23 @@ xychart-beta
 | 100 | 41,368 | 2.0ms |
 | 500 | 37,024 | 13ms |
 
-```mermaid
-xychart-beta
-    title "처리 종류별 — 동시 100연결 (초당 요청 수)"
-    x-axis ["정적 파일", "Reverse Proxy", "CGI"]
-    y-axis "초당 요청" 0 --> 45000
-    bar [41368, 16800, 1250]
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/perf-by-type-dark.svg">
+    <img alt="처리 종류별 처리량" src="docs/img/perf-by-type-light.svg" width="760">
+  </picture>
+</p>
 
 CGI는 요청마다 프로세스를 새로 만들고(`fork` + `execve`), 프록시는 백엔드와 연결을 하나 더 맺기 때문에 정적 파일보다 느립니다.
 
 **측정으로 찾아 고친 병목** (정적 파일, 동시 10연결)
 
-```mermaid
-xychart-beta
-    title "병목을 고칠 때마다 (초당 요청 수)"
-    x-axis ["처음", "TCP_NODELAY", "작은 파일 캐시"]
-    y-axis "초당 요청" 0 --> 100000
-    bar [173, 3058, 92750]
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/perf-steps-dark.svg">
+    <img alt="병목 개선 단계별 처리량" src="docs/img/perf-steps-light.svg" width="760">
+  </picture>
+</p>
 
 | 단계 | 원인 | 해결 | 초당 요청 |
 |---|---|---|:---:|
@@ -335,6 +329,9 @@ curl -x 127.0.0.1:8080 http://127.0.0.1:8001/index.html        # Forward
 
 ## Part 1. 서버 시작과 연결 받기
 
+<details>
+<summary><b>동작 · 검증 펼쳐 보기</b></summary>
+
 `main.c` → `run_server()` → `open_listenfd()` → 워커 생성 → `pselect` + `accept` 루프
 
 **동작**
@@ -364,9 +361,14 @@ curl -x 127.0.0.1:8080 http://127.0.0.1:8001/index.html        # Forward
 | 스레드 풀 | 동시 submit, 큐 가득 참, 종료 시 남은 작업 처리 (`test_threadpool`) | 20회 반복 실행 모두 통과 |
 | 네트워크 도우미 | 포트 문자열 경계값(`""` `65536` `+80`), bind 실패, CLOEXEC (`test_net`) | 통과 |
 
+</details>
+
 ---
 
 ## Part 2. 요청 읽기
+
+<details>
+<summary><b>동작 · 검증 펼쳐 보기</b></summary>
 
 `handle_connection()` → `read_request()` (`rio.c`) → 파싱 오류면 `reply_error()`
 
@@ -398,9 +400,14 @@ curl -x 127.0.0.1:8080 http://127.0.0.1:8001/index.html        # Forward
 | 시간 제한 | 요청 줄만 보내고 멈춤 / 1초에 1바이트씩 14초 | 둘 다 **408** |
 | 큰 본문 | 1MB 상한을 넘는 3MB 본문 | 413 응답이 **실제로 도착** (RST로 사라지지 않음) |
 
+</details>
+
 ---
 
 ## Part 3. 요청 분기와 정적 파일
+
+<details>
+<summary><b>동작 · 검증 펼쳐 보기</b></summary>
 
 `dispatch()` → `static_file.c` + `mime.c` → `send_headers` / `send_response`
 
@@ -430,9 +437,14 @@ curl -x 127.0.0.1:8080 http://127.0.0.1:8001/index.html        # Forward
 | 캐시 | 1초 안 재요청 = 이전 내용, 1초 뒤 = 새 내용, 루트가 다르면 섞이지 않음, 64KB 초과는 캐시 안 함 | 통과 |
 | 성능 병목 | 시스템 콜 하나씩 시간 측정 → `/mnt/c`(9P)에서 `realpath` 1.6ms · `open` 1.7ms가 원인 | 캐시 적용 후 **초당 3,120 → 92,750건** |
 
+</details>
+
 ---
 
 ## Part 4. CGI
+
+<details>
+<summary><b>동작 · 검증 펼쳐 보기</b></summary>
 
 `/cgi-bin/<이름>` → `serve_cgi()` (`fork` + `execve`)
 
@@ -458,9 +470,14 @@ curl -x 127.0.0.1:8080 http://127.0.0.1:8001/index.html        # Forward
 | 시그널 | 워커처럼 SIGINT를 막은 스레드에서 실행 → CGI의 `SigBlk` / `SigIgn` 확인 | 기본값으로 복구됨 |
 | 예제 `adder` | 정상, 음수, 항목 개수 오류, 정수가 아님, 덧셈 오버플로, 잘못된 `CONTENT_LENGTH` | 200 / 400 정확 |
 
+</details>
+
 ---
 
 ## Part 5. Reverse Proxy · Forward Proxy
+
+<details>
+<summary><b>동작 · 검증 펼쳐 보기</b></summary>
 
 `router.c` (라우팅) · `proxy.c` (공통 중계 `proxy_relay`) · `forward_proxy.c`
 
@@ -495,9 +512,14 @@ curl -x 127.0.0.1:8080 http://127.0.0.1:8001/index.html        # Forward
 | URI 파싱 | 기본 포트, 쿼리, `#조각`, IPv6, `user@host`, 범위 밖 포트 (`test_forward_proxy`) | 통과 |
 | 실제 서버 | 백엔드 2개가 번갈아 응답, 하나 끄면 나머지로, 둘 다 끄면 502, 없는 도메인 502, 자기 자신을 대상으로 해도 루프 없음 | 통과 |
 
+</details>
+
 ---
 
 ## Part 6. 연결 유지·닫기와 서버 종료
+
+<details>
+<summary><b>동작 · 검증 펼쳐 보기</b></summary>
 
 `계속할지 판단` → `lingering_close()` / SIGINT·SIGTERM → 종료
 
@@ -528,6 +550,8 @@ curl -x 127.0.0.1:8080 http://127.0.0.1:8001/index.html        # Forward
 | 종료 | SIGINT / SIGTERM / 시그널 연속 3번 / 유휴 연결이 붙어 있을 때 | 모두 `exit 0`, 1초 안에 종료 |
 | 종료 중 요청 | SIGINT 직후 새 연결 / 처리 중이던 연결 | 새 연결 거부, 처리 중인 요청은 끝까지 응답 |
 | 자원 | 요청 수백 번 뒤 열린 소켓 · fd 개수 | 듣기 소켓 1개만 남음, fd 변화 없음 |
+
+</details>
 
 ---
 
