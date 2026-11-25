@@ -9,7 +9,7 @@ const THEMES = {
   light: { surface: '#fcfcfb', border: 'rgba(11,11,11,0.10)', p: '#0b0b0b', s: '#52514e', m: '#898781',
            grid: '#e1e0d9', base: '#c3c2b7', s1: '#2a78d6', s2: '#eb6834', tile: '#f5f5f2' },
   dark:  { surface: '#1a1a19', border: 'rgba(255,255,255,0.10)', p: '#f0efec', s: '#c3c2b7', m: '#898781',
-           grid: '#2c2c2a', base: '#383835', s1: '#3987e5', s2: '#d95926', tile: '#222221' },
+           grid: '#2c2c2a', base: '#383835', s1: '#3987e5', s2: '#d95926', tile: '#2b2b29' },
 };
 const FONT = `system-ui, -apple-system, 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans KR', sans-serif`;
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
