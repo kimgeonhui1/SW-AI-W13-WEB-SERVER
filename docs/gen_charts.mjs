@@ -58,7 +58,7 @@ function hero(t) {
   const W = 880, H = 236;
   const tiles = [
     ['기능 테스트', '145 / 145', '실제 서버 · 일반 + ASan'],
-    ['단위 테스트 검사', '732', '11개 파일 전부 통과'],
+    ['단위 테스트 검사문', '732', 'CHECK 문 · 전부 통과'],
     ['메모리 오류 · 누수', '0', 'ASan · valgrind'],
     ['변이 테스트 검출', '61 / 63', '남은 2개는 등가 변이'],
     ['정적 파일 처리량', '92,750', '초당 요청 · 동시 10연결'],
@@ -180,7 +180,7 @@ const charts = {
     max: 45, labelW: 140, suffix: '개',
   }),
   'unit-by-file': (t) => hbars(t, {
-    title: '단위 테스트 검사 732개 — 파일별', sub: 'tests/test_*.c · 일반 빌드와 ASan/UBSan 빌드 모두 통과',
+    title: '단위 테스트 검사문 732개 — 파일별', sub: 'tests/test_*.c의 CHECK 문 개수 · 일반 빌드와 ASan/UBSan 빌드 모두 통과',
     rows: [['rio', 156], ['proxy', 81], ['static_response', 80], ['http_request', 73], ['router', 66], ['net', 58],
            ['cgi', 53], ['forward_proxy', 53], ['server', 51], ['threadpool', 32], ['mime', 29]],
     max: 160, labelW: 130, suffix: '개',
