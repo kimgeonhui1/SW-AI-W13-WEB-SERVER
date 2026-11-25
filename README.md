@@ -3,7 +3,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/hero-dark.svg">
-    <img alt="기능 테스트 145/145 · 단위 테스트 검사문 732 · 메모리 오류 0 · 변이 61/63 · 초당 92,750건" src="docs/img/hero-light.svg" width="880">
+    <img alt="기능 테스트 146/146 · 단위 테스트 검사문 737 · 메모리 오류 0 · 변이 61/63 · 초당 92,750건" src="docs/img/hero-light.svg" width="880">
   </picture>
 </p>
 
@@ -95,14 +95,14 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/tests-by-area-dark.svg">
-    <img alt="기능 테스트 145개 영역별 막대 그래프" src="docs/img/tests-by-area-light.svg" width="760">
+    <img alt="기능 테스트 146개 영역별 막대 그래프" src="docs/img/tests-by-area-light.svg" width="760">
   </picture>
 </p>
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/img/unit-by-file-dark.svg">
-    <img alt="단위 테스트 검사문(CHECK) 732개 파일별 막대 그래프" src="docs/img/unit-by-file-light.svg" width="760">
+    <img alt="단위 테스트 검사문(CHECK) 737개 파일별 막대 그래프" src="docs/img/unit-by-file-light.svg" width="760">
   </picture>
 </p>
 
@@ -481,7 +481,7 @@ curl -x 127.0.0.1:8080 http://127.0.0.1:8001/index.html        # Forward
 | 방법 | 내용 | 결과 |
 |---|---|---|
 | **컴파일 경고** | `-Wall -Wextra -Werror` | 경고 0 |
-| **ASan / UBSan** | 단위 테스트 전부 + ASan 빌드 서버로 기능 테스트 145개 | 오류 0 |
+| **ASan / UBSan** | 단위 테스트 전부 + ASan 빌드 서버로 기능 테스트 146개 | 오류 0 |
 | **valgrind** | 실제 서버에 정적 · CGI · Reverse · Forward · 깨진 요청 · 동시 30연결을 보낸 뒤 SIGINT | `All heap blocks were freed`, `ERROR SUMMARY: 0 errors` |
 | **변이 테스트** | 코드를 일부러 망가뜨려(검사 한 줄 삭제, 조건 뒤집기, 원자 연산 제거 …) 테스트가 실패하는지 확인 | 63개 중 61개 검출. 놓친 것은 테스트를 추가해 보완 (예: 처음엔 SIGPIPE 무시 설정을 지워도 아무 테스트도 실패하지 않아, 20MB 응답 도중 끊는 테스트를 추가). 남은 2개는 동작이 같은 등가 변이 (`pselect`의 EINTR 처리, CGI 입력 파이프를 닫는 시점) |
 | **부하** | `wrk` 동시 10 / 100 / 500연결, 10초 (`tests/load.sh`) | 결과는 [2-4. 성능](#2-4-성능-wrk-10초-keep-alive-워커-8개), 503·소켓 오류 0 |

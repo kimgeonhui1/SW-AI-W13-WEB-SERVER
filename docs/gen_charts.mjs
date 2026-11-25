@@ -57,8 +57,8 @@ function legend(t, x, y, items) {
 function hero(t) {
   const W = 880, H = 236;
   const tiles = [
-    ['기능 테스트', '145 / 145', '실제 서버 · 일반 + ASan'],
-    ['단위 테스트 검사문', '732', 'CHECK 문 · 전부 통과'],
+    ['기능 테스트', '146 / 146', '실제 서버 · 일반 + ASan'],
+    ['단위 테스트 검사문', '737', 'CHECK 문 · 전부 통과'],
     ['메모리 오류 · 누수', '0', 'ASan · valgrind'],
     ['변이 테스트 검출', '61 / 63', '남은 2개는 등가 변이'],
     ['정적 파일 처리량', '92,750', '초당 요청 · 동시 10연결'],
@@ -175,15 +175,15 @@ const charts = {
   }),
   'perf-steps': steps,
   'tests-by-area': (t) => hbars(t, {
-    title: '기능 테스트 145개 — 영역별', sub: '실제 서버를 띄워 curl · nc로 확인 (tests/functional.sh)',
-    rows: [['시작 · 인자', 42], ['응답 · 정적 · CGI', 35], ['프록시', 24], ['종료 · 자원', 18], ['동시성 · 큐', 16], ['요청 읽기', 10]],
+    title: '기능 테스트 146개 — 영역별', sub: '실제 서버를 띄워 curl · nc로 확인 (tests/functional.sh)',
+    rows: [['시작 · 인자', 42], ['응답 · 정적 · CGI', 35], ['프록시', 24], ['종료 · 자원', 18], ['동시성 · 큐', 17], ['요청 읽기', 10]],
     max: 45, labelW: 140, suffix: '개',
   }),
   'unit-by-file': (t) => hbars(t, {
-    title: '단위 테스트 검사문 732개 — 파일별', sub: 'tests/test_*.c의 CHECK 문 개수 · 일반 빌드와 ASan/UBSan 빌드 모두 통과',
-    rows: [['rio', 156], ['proxy', 81], ['static_response', 80], ['http_request', 73], ['router', 66], ['net', 58],
+    title: '단위 테스트 검사문 737개 — 파일별', sub: 'tests/test_*.c의 CHECK 문 개수 · 일반 빌드와 ASan/UBSan 빌드 모두 통과',
+    rows: [['rio', 161], ['proxy', 81], ['static_response', 80], ['http_request', 73], ['router', 66], ['net', 58],
            ['cgi', 53], ['forward_proxy', 53], ['server', 51], ['threadpool', 32], ['mime', 29]],
-    max: 160, labelW: 130, suffix: '개',
+    max: 170, labelW: 130, suffix: '개',
   }),
   mutation,
 };
