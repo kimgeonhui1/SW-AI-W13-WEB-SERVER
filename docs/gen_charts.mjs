@@ -191,15 +191,15 @@ const charts = {
 // ───────────── 구조도 (노드 · 화살표) ─────────────
 // 역할별 왼쪽 띠 색: 메인 = 파랑, 워커 루프 = 회색, 프록시 = 보라, CGI·정적 = 청록, 오류·종료 = 빨강
 const ROLE = {
-  light: { main: '#2a78d6', worker: '#898781', proxy: '#6250d6', handler: '#1baf7a', err: '#d03b3b', panel: '#f3f3f0' },
-  dark:  { main: '#3987e5', worker: '#898781', proxy: '#9085e9', handler: '#199e70', err: '#d03b3b', panel: '#20201f' },
+  light: { main: '#2a78d6', worker: '#898781', proxy: '#6250d6', handler: '#1baf7a', err: '#d03b3b', panel: '#f3f3f0', node: '#ffffff', nodeBorder: 'rgba(11,11,11,0.14)' },
+  dark:  { main: '#3987e5', worker: '#898781', proxy: '#9085e9', handler: '#199e70', err: '#d03b3b', panel: '#20201f', node: '#2f2f2c', nodeBorder: 'rgba(255,255,255,0.16)' },
 };
 const MODE_OF = (t) => (t === THEMES.light ? 'light' : 'dark');
 
 function node(t, n, dim) {
   const r = ROLE[MODE_OF(t)];
   const op = dim ? ' opacity="0.32"' : '';
-  return `<g${op}><rect x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="8" fill="${t.surface}" stroke="${t.border}"/>` +
+  return `<g${op}><rect x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="8" fill="${r.node}" stroke="${r.nodeBorder}"/>` +
     `<rect x="${n.x}" y="${n.y}" width="4" height="${n.h}" rx="2" fill="${r[n.role]}"/>` +
     `<text x="${n.x + 14}" y="${n.y + (n.sub ? 20 : n.h / 2 + 4.5)}" font-size="13" font-weight="600" fill="${t.p}">${esc(n.title)}</text>` +
     (n.sub ? `<text x="${n.x + 14}" y="${n.y + 37}" font-size="11.5" fill="${t.s}">${esc(n.sub)}</text>` : '') + '</g>';
